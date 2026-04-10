@@ -1,0 +1,672 @@
+' ---------------------------------------------------------
+' CR6 Series
+' Program: Zugspitze
+' Author: Sergi Gonzalez from Thierry Hartmann program
+' Date: 04.10.2023, Version 1.0
+' Recycling from Davis_2019_v12 with LI-7500A & CSAT3
+'
+' Program measures:
+'  1x Licor LI-7500A C02/H20 Gas Analyzer
+'  1x Campbell CSAT3 three dimensional sonic anemometer
+'  1x CS215 Temperature/Relative Humidity (TRH)
+'  1x SI-111 IR Surface Temperature (IRT)
+'  1x SR50A Snow depth (i.e. distance to surface)
+'  2x 05108-45 Young wind monitor (WS,WD)
+'  1x GPS16X-HVS Garmin GPS
+'  Power management for SPC-95 Snow Particle Counter
+
+' Sensor Wiring: wire color (function) -> port
+' color code: red(rd), green(gn), blue(bl), yellow(ye), white(wh), black(bk)
+' color code: brown(bn), grey(gy), orange(or), violet(vt), pink(pk)
+
+' Power consumption:
+'   mA at 12V =  W  LI-7500A (at 25C)
+'   mA at 12V =  W  CSAT3 (at 25C)
+'     2mA at 12V =  0.024W  CS215 during 1s for measurement (quiescent: 70uA)
+'     0mA at 12V =  0.000W  SI-111
+'   250mA at 12V =  3.000W  SR50A during 1s for measurement (quiescent:  1mA)
+'   switched excitation voltage supplied by data logger, 2x Young Wind
+'    65mA at 12V =  0.780W  GPS Receiver
+'    50mA at 12V =  0.600W  CR6 estimated; 67mA @20Hz, 3mA @1Hz scan
+
+' NOTE: SR50A is expected to have SDI-12 address 1, CS215 the SDI12 address 0
+' To change this address, connect to logger using LoggerNet
+' Make sure only *one* SDI12 interface is connected to the same port
+' Choose Datalogger -> Terminal Emulator
+' Choose "Open terminal" and hit enter multiple times, until "CR6>" appears
+' Type SDI12 and select the port (for this program, select U9)
+' Verify address by typing: !?
+' Change address by typing: XAY!, where X = old address and Y = new address
+' Verify address again by typing !? to see if change was successful.
+' ---------------------------------------------------------
+
+SequentialMode
+
+' DECLARATIONS=============================================
+
+' Declare local time offset relative to UTC time for GPS
+Const LOCAL_TIME_OFFSET = 0    ' Local time offset relative to UTC time
+
+' Power cut-off values (battery voltage)
+Const LowVoltSPC = 12.2        ' Low power threshold for SPC-95,  (PowerSPC, SW1)
+'Const LowVoltIRG = 12.0        ' Low power threshold for IRGASON, (PowerIRG, SW2)
+
+' SPC-95 parameters
+' Values for field installation
+                                       ' the following line should force the creation of a new file after XXX minutes
+Const SPC_Forced_Restart = 10080       ' In minutes: Trigger restart of SPC every XXX minutes (10080 min = 7 days)
+Const SPC_Forced_Restart_Time = 1      ' In minutes: SPC delay period (power off) before triggered restart 
+Const SPC_LowPowerOff = 60             ' In minutes: At low battery, SPC idle time (power off) before restart (720 min = 12 h)
+
+' Scan frequencies 
+Const SFREQ1 = 100    ' [mSec] Main scan interval, (100mSec = 10Hz)
+Const SFREQ2 = 60     ' [Sec]  Slow sequence (1min)
+
+' Output frequencies
+Const OFREQ1 = 100    ' [mSec] fast output (CSAT3, LI7500, 10Hz)
+Const OFREQ2 = 60     ' [Sec]  slow output (Meteo/Stat data, 1min)
+
+' Table Management-----------------------------------------
+' Output Data Table selection for fast freq. data is based on Day of Year (DOY)
+' Data is written for 28 days to a table before a new Table is started
+' Note: A 10Hz scan frequency produces 864'000 records (lines) per day
+' Table space is auto-allocated between 13 tables for the fast data.
+' 1min data tables have specified record lengths, i.e. 365*24*60 = 1 year 
+
+Dim WhichTable As Long
+Const nRec2 = 247*24*60  '#recs to allocate for slow output for 1 year @1min
+
+
+'----------------------- CSAT3 --------------------------------------------------
+SDMBeginPort(C1)
+' CSAT3 address
+Const CSAT3_address = 2	'S/N:1255
+' CSAT3 execution parameter
+Const CSAT_OPT = INT(1000/SFREQ1)  'Denominator in mSec
+' Default SDM clock speed
+Const SDM_PER = 30
+
+Public wind(5)
+
+Alias wind(1) = Ux
+Alias wind(2) = Uy
+Alias wind(3) = Uz
+Alias wind(4) = Ts
+Alias wind(5) = diag_csat
+Units wind = m/s
+Units Ts = degC
+Units diag_csat = unitless
+
+' CSAT3 warning flags:
+' 1) delta temperature, 2) poor signal lock,
+' 3) amplitude high, or 4) amplitude low.
+Public diag_bits(4) As Boolean
+Units diag_bits = samples
+
+Alias diag_bits(1) = delT_f
+Alias diag_bits(2) = sigl_f
+Alias diag_bits(3) = amph_f
+Alias diag_bits(4) = ampl_f
+
+' Diagnostic variables
+Dim disable_flag_on(2) As Boolean
+Dim n
+Units n = samples
+
+' Working variables
+Dim diag_csat_work As Long
+
+' LI-7500A --------------------------------------------------
+Const LIC75_address = 0  'Licor #2, SDM: 12
+  
+Public LIC75(4) 'Licor output mode set equal to 6 !!!
+
+Alias LIC75(1) = LI_CO2m  'CO2 [mmol/m3]
+Alias LIC75(2) = LI_H2Om  'H2O [mmol/m3]
+Alias LIC75(3) = LI_Pres  'Pressure [kPa]
+Alias LIC75(4) = LI_diag  'Diagnostic value
+
+Units LI_CO2m = mmol/m3
+Units LI_H2Om = mmol/m3
+Units LI_Pres = kPa
+Units LI_diag = unitless  
+
+Public diag_LI_bits(4) As Boolean
+Units diag_LI_bits = samples
+Alias diag_LI_bits(1) = li_chopper
+Alias diag_LI_bits(2) = li_detector
+Alias diag_LI_bits(3) = li_pll
+Alias diag_LI_bits(4) = li_sync
+
+Dim diag_licor_work As Long
+
+
+' Other variables------------------------------------------
+
+' Power and Time
+Public BattV
+Public PowerSPC   ', PowerIRG
+Public timer_PowerSPC_off, timer_PowerSPC_on
+Public timer_PowerSPC_off_offset
+Units BattV = V
+
+'Public clockmod
+Public LoggerTime(9) As Long
+Alias LoggerTime(2) = month
+Alias LoggerTime(9) = doy
+
+' GPS using the Serial Instruction------------------------- 
+
+'GPS16X-HVS at Campbell Scientific Factory Defaults
+Const GPSPort = ComRS232 'Com port where GPS is connected
+Public GGAstring As String * 500
+Public RMCstring As String * 500
+'rmc variables
+'Public rmcid As String
+Public rmcutc As String
+'Public rmcstatus As String
+Public rmclatitude As String
+'Public rmcin_s_ind As String
+Public rmclongitude As String
+'Public rmcie_w_ind As String
+'Public rmcspeed As String
+'Public rmccourse As String
+Public rmcutcdate As String
+'Public rmcmagvariation As String
+'Public rmcmage_w As String
+'Public rmcchecksum As String
+'gga variables
+'Public ggaid As String
+'Public ggautc As String
+'Public ggailatitude As String
+'Public ggan_s_ind As String
+'Public ggalongitude As String
+'Public ggae_w_ind As String
+'Public ggapositionfix As String
+'Public gganumsatellites As String
+'Public ggahdop As String
+'Public ggaaltitude As String
+'Public ggaaltutudeunits As String
+'Public ggageoidsep As String
+'Public ggageoidunits As String
+'Public ggachecksum As String
+
+Dim NBytesReturned As Long
+Dim SubStrings(16) As String * 32, rawdata As String * 500
+Dim CalculatedChecksum As Long, ReportedChecksum As Long
+
+' Other Sensors--------------------------------------------
+
+' SI-111 constants (FROM CALIBRATION SHEET!)
+' S/N: SI-111-L-10_7289 (CS: 1072 ???????)
+Const mC2 = 100573
+Const mC1 = 8427070
+Const mC0 = 1444790000
+Const bC2 = 5075.53
+Const bC1 = 91880.5
+Const bC0 = -5055710
+
+Public PTemp            'CR6
+Public TRHData(2)		    'CS215
+Alias TRHData(1) = TA   'CS215
+Alias TRHData(2) = RH		'CS215
+Public HSData_1min(2)		    'SR50A
+Alias HSData_1min(1)=HS_Raw_1min	'SR50A
+Alias HSData_1min(2)=HS_Qty_1min	'SR50A
+Public HS_Cor_1min 			    'SR50A
+
+Public HSData(11,2)		  'SR50A'
+Public HSData_Raw(2)    'SR50A'
+Alias HSData_Raw(1)=HS_Raw     : Units HS_Raw = meters	  'SR50A
+Alias HSData_Raw(2)=HS_Qty_Raw : Units HS_Qty_Raw = unitless	'SR50A
+Public Results_HSData(11,2)                           'SR50A'
+Public HS_Cor       : Units HS_Cor       = meters 	  'SR50A'
+Public HS_Qty       : Units HS_Qty       = unitless   'SR50A'
+'Public SR50ACtrl As Boolean
+Public TRHData_Fast(2)         'T for SR50A correction'
+Alias TRHData_Fast(1) = TAfast 'T for SR50A correction'
+Public SR50ACtrl As Boolean
+
+Public WS1			        'YOUNG1
+Public WD1			        'YOUNG1
+Public WS2			        'YOUNG2
+Public WD2			        'YOUNG2
+Public m,b 			        'SI-111
+Public TargmV			      'SI-111
+Public SFTempK		      'SI-111
+Public SBTempC			    'SI-111
+Public SBTempK			    'SI-111
+Public SFTempC          'SI-111
+Units PTemp = C	        'CR6
+Units TA = C  		      'CS215
+Units RH = %		        'CS215
+Units HS_Cor_1min = m		    'SR50A
+Units WS1 = m/s			    'YOUNG1
+Units WD1 = deg			    'YOUNG1
+Units WS2 = m/s			    'YOUNG2
+Units WD2 = deg			    'YOUNG2
+
+' Define Data Tables---------------------------------------
+
+DataTable(DAVISwind,True,-1)
+	DataInterval(0,OFREQ2,Sec,0)
+	CardOut(1,nRec2)
+  Average(1,WS1,FP2,False)        ' mean over OFREQ2 interval (here 1min)
+  Maximum(1,WS1,FP2,False,False)  ' max. over a 1sec interval (wind gust)
+  StdDev(1,WS1,FP2,False)         ' Std. over OFREQ2 interval (here 1min)
+  Average(1,WS2,FP2,False)
+  Maximum(1,WS2,FP2,False,False)
+  StdDev(1,WS2,FP2,False)
+  Average(4,Ux,IEEE4,False)
+  StdDev(1,Ux,IEEE4,False)
+EndTable
+
+DataTable(DAVIS1Min,True,-1)    'XX columns in table, incl. time stamp and record no.
+  DataInterval(0,OFREQ2,Sec,0)
+  CardOut(1,nRec2)
+'  Sample (1,latitude_a,FP2)
+'  Sample (1,longitude_a,FP2)
+'  Sample (1,altitude,FP2)
+'  Totalize (1,clockmod,Long,False)
+'  Sample (1,rmcid,String)
+  Sample (1,rmcutc,String)
+'  Sample (1,rmcstatus,String)
+  Sample (1,rmclatitude,String)
+'  Sample (1,rmcin_s_ind,String)
+  Sample (1,rmclongitude,String)
+'  Sample (1,rmcie_w_ind,String)
+'  Sample (1,rmcspeed,String)
+'  Sample (1,rmccourse,String)
+  Sample (1,rmcutcdate,String)
+'  Sample (1,rmcmagvariation,String)
+'  Sample (1,rmcmage_w,String)
+'  Sample (1,rmcchecksum,String)
+'  Sample (1,ggaid,String)
+'  Sample (1,ggautc,String)
+'  Sample (1,ggan_s_ind,String)
+'  Sample (1,ggalongitude,String)
+'  Sample (1,ggae_w_ind,String)
+'  Sample (1,ggapositionfix,String)
+'  Sample (1,gganumsatellites,String)
+'  Sample (1,ggahdop,String)
+'  Sample (1,ggaaltitude,String)
+'  Sample (1,ggaaltutudeunits,String)
+'  Sample (1,ggageoidsep,String)
+'  Sample (1,ggageoidunits,String)
+'  Sample (1,ggachecksum,String)
+
+  Minimum(1,BattV,FP2,False,False)
+  Average(1,PTemp,FP2,False)
+  Sample (1,PowerSPC,Long,False)
+'  Sample (1,PowerIRG,Long,False)
+  Sample(1,WD1,FP2)
+  Sample(1,WD2,FP2)
+  Sample(1,TA,FP2)
+  Sample(1,RH,FP2)
+  Sample(1,HS_Cor_1min,FP2)
+  Sample(1,HS_Qty_1min,FP2)
+  Sample(1,SBTempC,IEEE4)
+  Sample(1,SFTempC,IEEE4)
+  Average(4,LI_CO2m,IEEE4,0)
+  StdDev (4,LI_CO2m,IEEE4,0)
+  Average(4,Ux,IEEE4,disable_flag_on(1))
+  StdDev (4,Ux,IEEE4,disable_flag_on(1))
+  Totalize(1,n,IEEE4,disable_flag_on(1))
+  Totalize(1,n,IEEE4,NOT(disable_flag_on(1) OR disable_flag_on(2)))
+  FieldNames("csat_warnings")
+  Totalize(1,n,IEEE4,NOT(delT_f) OR NOT disable_flag_on(2))
+  FieldNames("delT_f_Tot")
+  Totalize(1,n,IEEE4,NOT(sigl_f) OR NOT disable_flag_on(2))
+  FieldNames("sigl_f_Tot")
+  Totalize(1,n,IEEE4,NOT(amph_f) OR NOT disable_flag_on(2))
+  FieldNames("amph_f_Tot")
+  Totalize(1,n,IEEE4,NOT(ampl_f) OR NOT disable_flag_on(2))
+  FieldNames("ampl_f_Tot")
+  
+  Totalize(1,n,IEEE4,li_chopper)
+  FieldNames("li_chopper")
+  Totalize(1,n,IEEE4,li_detector)
+  FieldNames("li_detector")
+  Totalize(1,n,IEEE4,li_pll)
+  FieldNames("li_pll")
+  Totalize(1,n,IEEE4,li_sync)
+  FieldNames("li_sync")
+EndTable
+
+DataTable(DAVIS1Min_HS,True,-1)    'XX columns in table, incl. time stamp and record no.
+  DataInterval(0,OFREQ2,Sec,0)
+  CardOut(1,nRec2)
+  Sample(1,HS_Cor,FP2)
+  Sample(1,HS_Qty,FP2)
+EndTable
+
+
+DataTable(DAVISfast01,True,-1)
+  DataInterval(0,OFREQ1,mSec,10)
+  CardOut(1,-1)
+  Sample(4,Ux,IEEE4)
+  Sample(4,LI_CO2m,IEEE4)
+EndTable
+
+DataTable(DAVISfast02,True,-1)
+  DataInterval(0,OFREQ1,mSec,10)
+  CardOut(1,-1)
+  Sample(4,Ux,IEEE4)
+  Sample(4,LI_CO2m,IEEE4)
+EndTable
+
+DataTable(DAVISfast03,True,-1)
+  DataInterval(0,OFREQ1,mSec,10)
+  CardOut(1,-1)
+  Sample(4,Ux,IEEE4)
+  Sample(4,LI_CO2m,IEEE4)
+EndTable
+
+DataTable(DAVISfast04,True,-1)
+  DataInterval(0,OFREQ1,mSec,10)
+  CardOut(1,-1)
+  Sample(4,Ux,IEEE4)
+  Sample(4,LI_CO2m,IEEE4)
+EndTable
+
+' MEASUREMENTS=============================================
+
+' Main Program
+
+BeginProg
+  timer_PowerSPC_off_offset = 43200   'in [sec] = 12h       
+  'This offset ensures that the SPC will be switched on when the logger starts. 
+  'Should just be large, in any case larger than  ??
+
+  'Open serial port for GPS
+  SerialOpen(GPSPort,38400,3,0,1001)
+
+  'Set all CSAT3 variables to NaN.
+  Move(Ux,5,NaN,1)
+
+  'Set the SDM clock speed.
+  SDMSpeed(SDM_PER)
+
+  n = 0
+
+  'Main Scan+++++++++++++++++++++++++++++++++++++++++++++++
+  
+  Scan(SFREQ1,mSec,5,0)
+    
+      SDMTrigger()
+    
+      '***Measure CSAT3 and LI7500-------------------------
+          
+      'Get data from CSAT3, 98: Get wind & sonic temperature data after a group trigger 
+      ' CSAT_OPT: 10Hz execution parameter
+      CSAT3(Ux,1,CSAT3_address,98,CSAT_OPT)
+      'Get data from LI7500
+      CS7500(LI_CO2m,1,LIC75_address,6)
+      
+      'CSAT3 processing------------------------------------
+      'Define 61502 as NaN
+      If (diag_csat = NaN) Then 
+        (diag_csat = 61502)
+        Ux = NaN
+        Uy = NaN
+        Uz = NaN
+        Ts = NaN
+      EndIf  
+        'Break up the 4 CSAT3 warning flags in 4 separate bits
+        diag_csat_work = diag_csat
+        delT_f = diag_csat_work AND &h8000
+        sigl_f = diag_csat_work AND &h4000
+        amph_f = diag_csat_work AND &h2000
+        ampl_f = diag_csat_work AND &h1000
+  
+        'Turn on the intermediate processing disable flag when any CSAT3 warning flag is
+        'high, including the special cases NaN (61502), a Lost Trigger (61440), No Data
+        '(61503), an SDM error (61441), or wrong CSAT3 embedded code (61442).
+        disable_flag_on(1) = diag_csat_work AND &hf000
+        'Turn on only when CSAT3 diagnostic warning flags are set.
+        disable_flag_on(2) = (disable_flag_on(1) AND NOT (Ts=NaN))
+
+        'Save the four most significant bits of the CSAT3 diagnostics, except for the
+        'special cases NaN (61502), a Lost Trigger (61440), No Data (61503), an SDM
+        'error (61441), or wrong CSAT3 embedded code (61442).
+        If (diag_csat_work<&hf000) Then 
+          diag_csat = INT(diag_csat_work/&h1000)
+        EndIf
+
+      'Licor diag -----------------------------------------------
+      diag_licor_work = LI_diag
+      li_chopper = diag_licor_work AND &h80
+      li_detector = diag_licor_work AND &h40
+      li_pll = diag_licor_work AND &h20
+      li_sync = diag_licor_work AND &h10
+      'Call data tables and store Fast Data----------------
+
+      WhichTable = Floor(doy/28) + 1  
+      
+      Select Case WhichTable
+      Case 1
+        CallTable DAVISfast01
+      Case 2
+        CallTable DAVISfast02
+      Case 3
+        CallTable DAVISfast03
+      Case 4
+        CallTable DAVISfast04
+      Case 5
+        CallTable DAVISfast01
+      Case 6
+        CallTable DAVISfast02
+      Case 7
+        CallTable DAVISfast03
+      Case 8
+        CallTable DAVISfast04
+      Case 9
+        CallTable DAVISfast01
+      Case 10
+        CallTable DAVISfast02
+      Case 11
+        CallTable DAVISfast03
+      Case 12
+        CallTable DAVISfast04
+      Case Else
+        CallTable DAVISfast01
+      EndSelect
+
+    '*** Measure wind speed as a mean of the last second (1000ms)
+    '--- rd=P_LLAC, bk=WS_gnd, gn=WD_Sig, bl=WD_Ex, gy/wh=WD_gnd, cl=shld
+    PulseCount(WS1,1,U12,5,1000,0.1666,0)	' Young 1
+    PulseCount(WS2,1,U2 ,5,1000,0.1666,0)	' Young 2
+    'PulseCount instruction not allowed in SlowSequence
+    
+    CallTable DAVISwind
+  NextScan
+
+  '++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+  SlowSequence
+
+  Scan (SFREQ2,Sec,3,0)
+
+    'Get logger time
+    RealTime(LoggerTime)
+    
+    '*** Measure the Datalogger Battery Voltage
+    Battery(BattV)
+
+    '*** Measure the Datalogger Wiring Panel Temperature
+    PanelTemp(PTemp,60)
+    
+    'Voltage regulations
+    ' STAGE 1: SPC-----------------------------------------
+    ' If BattV drops below LowVoltSPC, switch off SPC
+    If(BattV < LowVoltSPC) Then
+      SW12(1,0)
+      PowerSPC = 0
+      timer_PowerSPC_off = Timer(1,min,2)  'Reset and start timer_PowerSPC_on
+      timer_PowerSPC_off_offset = 0
+      timer_PowerSPC_on = 0
+    EndIf
+    If(timer_PowerSPC_on > SPC_Forced_Restart) Then
+    ' Switch off to trigger a forced restart
+      SW12(1,0)
+      PowerSPC = 0
+      timer_PowerSPC_off = Timer(1,min,2)  'Reset and start timer_PowerSPC_off
+      timer_PowerSPC_off_offset = SPC_LowPowerOff-SPC_Forced_Restart_Time
+      timer_PowerSPC_on = 0
+    EndIf
+    'If BattV is above LowVoltSPC + 0.2V, switch SPC on
+    If((BattV > LowVoltSPC + 0.2) AND (PowerSPC = 0) AND (timer_PowerSPC_off > SPC_LowPowerOff)) Then
+      SW12(1,1)
+      PowerSPC = 1
+      timer_PowerSPC_on = Timer(2,min,2)  'Reset and start timer_PowerSPC_on
+      timer_PowerSPC_off = 0
+      timer_PowerSPC_off_offset = 0
+    EndIf
+
+    If(PowerSPC = 0) Then
+      timer_PowerSPC_off = timer_PowerSPC_off_offset + Timer(1,min,4) ' Query timer PowerSPC_off
+    Else
+      timer_PowerSPC_on = Timer(2,min,4)                              ' Query timer PowerSPC_on
+    EndIf    
+
+    '*** Measure the YOUNG1 (WD only)
+    '--- Dest, Reps, Range, SEChan, ExChan, MeasPEx, ExmV, RevEx, Settlingtime, fN1, Mult, Offset
+    '--- rd=P_LLAC, bk=WS_gnd, gn=WD_Sig, bl=WD_Ex, gy/wh=WD_gnd, cl=shld
+    BrHalf(WD1,1,mV5000,U3,U5,1,2500,True,20000,60,355,0)
+    If WD1>=360 Then WD1=0
+    If WD1<0 Then WD1=0
+
+    '*** Measure the YOUNG2 (WD only)
+    '--- Dest, Reps, Range, SEChan, ExChan, MeasPEx, ExmV, RevEx, Settlingtime, fN1, Mult, Offset
+    '--- rd=P_LLAC, bk=WS_gnd, gn=WD_Sig, bl=WD_Ex, gy/wh=WD_gnd, cl=shld
+    BrHalf(WD2,1,mV5000,U4,U5,1,2500,True,20000,60,355,0)
+    If WD2>=360 Then WD2=0
+    If WD2<0 Then WD2=0
+
+    '*** Measure the SI-111
+    '--- Dest, Reps, SEChan, ExChan, SettlingTime, fN1, Mult, Offset
+    '--- rd=TC_H, bk=TC_L, cl=G, gn=SBT_Sig, bl=SBT_gnd, wh=SBT_Ex
+    '*** Measurement of sensor body temperature with inbuilt thermistor
+    Therm109(SBTempC,1,U6,U5,0,_60Hz,1,0)
+    '--- Dest, Reps, Range, DiffChan, RevDiff, SettlingTime, fN1, Mult, Offset
+    '*** Measurement thermopile detector (rd = Sig+ = U(hi), vt = Sig- = U(low))
+    VoltDiff(TargmV,1,mV200,U7,True,0,_60Hz,1,0)
+    'Calculation of m (slope) and b (intercept) coeffs for target temp calculation
+    m = mC2 * SBTempC^2 + mC1 * SBTempC + mC0
+    b = bC2 * SBTempC^2 + bC1 * SBTempC + bC0
+    'Calculation of target temperature
+    SBTempK = SBTempC + 273.15
+    SFTempK = ((SBTempK^4) + m * TargmV + b)^0.25
+    SFTempC = SFTempK - 273.15
+
+    '*** Measure the CS215 (SDM address: 0)
+    '--- Dest, SDIPort, SDIAddress, SDICommand, Mult, Offset
+    '--- rd=12V, wh=G, bk=G, gn=SDI-12(odd), cl=shld
+    SDI12Recorder(TRHData(),U9,"0","M!",1,0) 
+    'See CS215 manual Appendix D.2.5, Change Address Command (aAb!) (p.D-3), 
+    'to change the CS215 SDI-12 address from its default address of 0
+    
+        '*** Measure the SR50A (SDM address: 1)
+    '--- Dest, SDIPort, SDIAddress, SDICommand, Mult, Offset
+    '--- rd=12V, bk=G, gn=SDI-12(odd), wh=G, cl=G
+    'Use SDI-12 command "M1!" to receive Distance and Signal quality from the SR50A
+    SDI12Recorder(HSData_1min(),U9,"1","M1!",1,0) 
+    'Use TA to calculate corrected distance:
+    HS_Cor_1min=HS_Raw_1min*(SQR((TA+273.15)/273.15))
+    
+   '*** Measure the GPS using the Serial instruction
+    '--- rd=12V, wh(RX)=RS-232, bl(TX)=RS-232, bk/ye/bl=G
+     SerialInRecord (GPSPort,rawdata,36,0,&h0D0A,NBytesReturned,11)
+     CalculatedChecksum = CheckSum (rawdata,9,Len(rawdata) - 3)
+     CalculatedChecksum = CalculatedChecksum AND 255
+     ReportedChecksum = HexToDec(Right(rawdata,2))
+     If CalculatedChecksum = ReportedChecksum Then
+       If InStr (1,rawdata,"GPRMC",2) Then
+         RMCstring = rawdata
+       ElseIf InStr (1,rawdata,"GPGGA",2) Then
+         GGAstring = rawdata
+       EndIf
+     EndIf
+     
+     SerialInRecord (GPSPort,rawdata,36,0,&h0D0A,NBytesReturned,11)
+     CalculatedChecksum = CheckSum (rawdata,9,Len(rawdata) - 3)
+     CalculatedChecksum = CalculatedChecksum AND 255
+     ReportedChecksum = HexToDec(Right(rawdata,2))
+     If CalculatedChecksum = ReportedChecksum Then
+       If InStr (1,rawdata,"GPRMC",2) Then
+         RMCstring = rawdata
+       ElseIf InStr (1,rawdata,"GPGGA",2) Then
+         GGAstring = rawdata
+       EndIf
+     EndIf
+
+     'parse rmc data
+     SplitStr (SubStrings(),RMCstring,",",16,5)
+'     rmcid = SubStrings(1)
+     rmcutc = SubStrings(2)
+'     rmcstatus = SubStrings(3)
+     rmclatitude = SubStrings(4)
+'     rmcin_s_ind = SubStrings(5)
+     rmclongitude = SubStrings(6)
+'     rmcie_w_ind = SubStrings(7)
+'     rmcspeed = SubStrings(8)
+'     rmccourse = SubStrings(9)
+     rmcutcdate = SubStrings(10)
+'     rmcmagvariation = SubStrings(11)
+'     rmcmage_w = Left(SubStrings(12),1)
+'     rmcchecksum = Right(RMCstring,2)
+     'parse gga data
+'     SplitStr (SubStrings(),GGAstring,",",16,5)
+'     ggaid=SubStrings(1)
+'     ggautc=SubStrings(2)
+'     ggailatitude=SubStrings(3)
+'     ggan_s_ind=SubStrings(4)
+'     ggalongitude=SubStrings(5)
+'     ggae_w_ind=SubStrings(6)
+'     ggapositionfix=SubStrings(7)
+'     gganumsatellites=SubStrings(8)
+'     ggahdop=SubStrings(9)
+'     ggaaltitude=SubStrings(10)
+'     ggaaltutudeunits=SubStrings(11)
+'     ggageoidsep=SubStrings(12)
+'     ggageoidunits=Left(SubStrings(13),1)
+'     ggachecksum=Right(GGAstring,2)
+
+  CallTable DAVIS1Min
+
+  NextScan
+
+  EndSequence
+  
+  SlowSequence
+  
+      n = 1
+      Scan (4,sec,3,0)
+        If TimeIntoInterval(4, 60, Sec) Then
+          SR50ACtrl = True
+        EndIf
+
+        If SR50ACtrl Then
+          SDI12Recorder(HSData_Raw(),U9,"1","M1!",1,0) 
+          SDI12Recorder(TRHData_Fast(),U9,"0","M!",1,0) 
+          'Use TA to calculate corrected distance:
+          HSData(n,1)=HSData_Raw(1)*(SQR((TAfast+273.15)/273.15))
+          HSData(n,2)=HSData_Raw(2)        
+          n += 1
+        
+
+          If n > 11 Then
+            n = 1
+            SR50ACtrl = False
+            SortSpa (Results_HSData(1,1),11,HSData(1,1),2)
+            HS_Cor = Results_HSData(6,1)
+            HS_Qty = Results_HSData(6,2)
+            
+          EndIf
+        EndIf
+      CallTable DAVIS1min_HS
+      NextScan
+  
+  EndSequence
+  
+EndProg
+   þ        
