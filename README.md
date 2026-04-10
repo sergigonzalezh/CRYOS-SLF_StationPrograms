@@ -7,6 +7,6 @@ Height: 2250 m
 Time: UTC+2
 
 
-## Cahngelog
+## Changelog
 04.01.2024 - 1st Installation of the station
 
