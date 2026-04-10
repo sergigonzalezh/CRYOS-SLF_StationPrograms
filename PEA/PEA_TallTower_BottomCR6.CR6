@@ -1,0 +1,489 @@
+' ---------------------------------------------------------
+' CR6 Series
+' Program: PEA2025 - BottomLogger CR6
+' Author and History:
+' 15.01.2024 - Hendrik Huwald, EPFL: Original program for PEA2024
+' 08.04.2024 - Sergi González-Herrero, SLF: Adaptation for PEA2025 with CR3000 and CSAT+LICOR
+' 19.11.2024 - Sergi González-Herrero, SLF: Changes with the final instruments for PEA2025 with CR1000X
+' 31.12.2024 - Sergi González-Herrero, SLF: Modification from CR1000X logger
+' 10.02.2025 - Sergi González-Herrero, SLF: Substitute the HygroVUE10 by a IPF HMP45 they lend us and take out the wind direction
+' 29.12.2025 - Rainette Engbers, EPFL: Remove Tsurf from bottom datalogger and put back in SFC datalogger
+' 
+'
+' Program, measures:
+'  1x GPS
+'  1x CSAT3 3D sonic anemometer at 10Hz
+'  1x Wind 05108-45 Young wind monitor (WS,WD)
+'  1x TH-P HygroVUE (5m)
+'  1x Tsurf SI-111 (5m)
+'  1x Rad SR50A (5m)
+'
+' Sensor Wiring: wire color (function) -> port
+' color code: red(rd), green(gn), blue(bl), yellow(ye), white(wh), black(bk), brown(bn),
+' color code: grey(gy), orange(or), violet(vt), pink(pk), bare(ba), cl=clear
+'
+' Power consumption:
+'     0mA at 12V =  0.000W  SI-111
+'    65mA at 12V =  0.780W  GPS Receiver
+'    50mA at 12V =  0.600W  CR6 estimated; 67mA @20Hz, 3mA @1Hz scan
+'
+'Options for Tall Tower
+' _5m = refers to the height of the instruments
+' _B = refers to the logger (U=Upper; L=Lower; B=Bottom)
+'
+' ---------------------------------------------------------
+
+'SequentialMode
+PipeLineMode
+
+'============================================================
+' DECLARATIONS ==============================================
+'============================================================
+
+' Sampling, output and time stamp--------------------------
+'SetSetting("Baudrate(COMC1)",115200)
+
+' Declare local time offset relative to UTC time for GPS
+Const LOCAL_TIME_OFFSET = 0    ' Local time offset relative to UTC time
+
+' Scan frequencies 
+Const SFREQ1 = 100    ' [mSec] Fast scan interval, main program (100mSec = 10Hz)
+Const SFREQ2 = 10    ' [Sec]  Slow scan interval, slow sequence
+
+' Output frequencies
+Const OFREQ1 = 100     ' [mSec] fast output
+Const OFREQ2 = 60     ' [Sec]  slow output
+
+' Default SDM clock speed for CSAT3 in [uSec]
+Const SDM_PER = 180
+
+' CSAT3 azimuth (if known)
+Const CSAT3_azimuth = 90
+
+'Adresses and Ports
+Const CSAT3_address_5m = 4	'### New CSAT #4 since Dec 2025, replaced the #1, S/N1254
+Const HygroVUE_address_5m = 0	' ### New Hygrovue since Dec 2025, Replaced HMP, S/N E8431
+Const CS320_address_5m = 1  'S/N:           ############################To check
+Const GPSPort = ComU1 'Com port where GPS is connected
+
+'Constants
+Const Young_mult = 0.1666 'S/N: ------ Multiplier depend on the model 05103/05106 = 0.0980, 05108(Alpine)=0.1666 and 05305=0.1024
+
+'============================================================
+' TABLE MANAGEMENT ==========================================
+'============================================================
+
+'---------------------------------------------------------
+'Power and Logger ----------------------------------------
+Public BattV_B
+Units BattV_B = V
+
+' Data logger wiring panel temperature
+Public PTemp_B
+Units PTemp_B = degC
+
+'---------------------------------------------------------
+'Public clockmod -----------------------------------------
+Public LoggerTime_B(9) As Long
+Alias LoggerTime_B(2) = month_B
+Alias LoggerTime_B(4) = hour_B
+Alias LoggerTime_B(5) = minute_B
+Alias LoggerTime_B(9) = doy_B
+
+'---------------------------------------------------------
+'HygroVUE10----------------------------------------------
+Public HygroVUE10_5m(2)
+Alias HygroVUE10_5m(1) = Temp_5m
+Alias HygroVUE10_5m(2) = RH_5m
+
+Units Temp_5m = Deg_C
+Units RH_5m = %
+
+'---------------------------------------------------------
+' SI-111--------------------------------------------------
+' SI-111 constants (FROM CALIBRATION SHEET!)
+' S/N:5661 (Station 1):
+'Const mC2 = 77121.6
+'Const mC1 = 7333840
+'Const mC0 = 1262700000
+'Const bC2 = 3459.13
+'Const bC1 = 169383
+'Const bC0 = -7469000
+
+'Public m,b 			        'SI-111
+'Public TargmV			      'SI-111
+'Public SFTempK		      'SI-111
+'Public SBTempC			    'SI-111
+'Public SBTempK			    'SI-111
+
+'Units SBTempK = K
+'Units SFTempK = K
+
+'---------------------------------------------------------
+' CS320---------------------------------------------------
+Public CS320_5m(6)         'ApogeePyranometer
+Alias CS320_5m(1) = SWdn_5m
+Alias CS320_5m(2) = SWdn_mV_5m
+Alias CS320_5m(3) = CS320_T_5m
+Alias CS320_5m(4) = X_orient_5m
+Alias CS320_5m(5) = Y_orient_5m
+Alias CS320_5m(6) = Z_orient_5m
+Units SWdn_5m = W/m2
+Units SWdn_mV_5m = mV
+Units CS320_T_5m = degC
+Units X_orient_5m = deg
+Units Y_orient_5m = deg
+Units Z_orient_5m = deg
+Dim Heater
+
+'---------------------------------------------------------
+' YOUNG Wind Monitor--------------------------------------
+Public WS_5m
+Public WD_5m
+
+Units WS_5m = m/s
+Units WD_5m = deg
+
+
+'---------------------------------------------------------
+' CSAT3---------------------------------------------------
+
+' CSAT3 execution parameter
+Const CSAT_OPT = INT(1000/SFREQ1)  'Denominator in [mSec]
+
+Public wind_5m(5)
+Alias wind_5m(1) = Ux_5m
+Alias wind_5m(2) = Uy_5m
+Alias wind_5m(3) = Uz_5m
+Alias wind_5m(4) = Ts_5m
+Alias wind_5m(5) = diag_csat_5m
+
+Units wind_5m = m/s
+Units Ts_5m = degC
+Units diag_csat_5m = none
+
+' CSAT3 warning flags:
+' 1) delta temperature, 2) poor signal lock,
+' 3) amplitude high, or 4) amplitude low.
+Public diag_bits_5m(4) As Boolean
+Units diag_bits_5m = samples
+
+Alias diag_bits_5m(1) = delT_f_5m
+Alias diag_bits_5m(2) = sigl_f_5m
+Alias diag_bits_5m(3) = amph_f_5m
+Alias diag_bits_5m(4) = ampl_f_5m
+
+' Diagnostic variables
+Dim disable_flag_on_5m(2) As Boolean
+Dim n_5m
+Units n_5m = samples
+
+' Working variables
+Dim diag_csat_work_5m As Long
+
+'Wind directions and speed.
+Dim wnd_out_5m(8)
+'Alias wnd_out_5m(1) = wnd_spd_5m - in compass coordinate system, same As CSAT3.
+'Alias wnd_out_5m(2) = rslt_wnd_spd_5m - in compass coordinate system, same As CSAT3.
+Alias wnd_out_5m(3) = wnd_dir_compass_5m
+'Alias wnd_out_5m(4) = std_wnd_dir_5m - in compass coordinate system, same As CSAT3.
+Alias wnd_out_5m(5) = wnd_spd_5m
+Alias wnd_out_5m(6) = rslt_wnd_spd_5m
+'Alias wnd_out_5m(7) = wnd_dir_csat3_5m
+'Alias wnd_out_5m(8) = std_wnd_dir_5m
+
+'Units wnd_dir_compass_5m = degrees
+'Units wnd_spd_5m = m/s
+'Units rslt_wnd_spd_5m = m/s
+'Units wnd_dir_csat3_5m = degrees
+'Units std_wnd_dir_5m = degrees
+
+'Working variables.
+'Dim wind_east_5m 'East wind in compass coordinate system.
+'Dim wind_north_5m 'North wind in compass coordinate system. 
+
+
+'---------------------------------------------------------
+'GPS using the Serial Instruction ------------------------ 
+'GPS16X-HVS at Campbell Scientific Factory Defaults
+'Public GGAstring As String * 500
+'Public RMCstring As String * 500
+Dim NMEASent(2) As String * 100
+
+Public GPSData(15)
+
+Alias GPSData(1)=Latitude_A
+Alias GPSData(2)=Latitude_B
+Alias GPSData(3)=Longitude_A
+Alias GPSData(4)=Longitude_B
+Alias GPSData(5)=Speed
+Alias GPSData(6)=Course
+Alias GPSData(7)=MagVar
+Alias GPSData(8)=FixQual
+Alias GPSData(9)=NumSats
+Alias GPSData(10)=Altitude
+Alias GPSData(11)=PPS
+Alias GPSData(12)=SecSinceGPRMC
+Alias GPSData(13)=GPSReady
+Alias GPSData(14)=MaxClockChange
+Alias GPSData(15)=NumClockChange
+
+Units Latitude_A=degrees
+Units Latitude_B=minutes
+Units Longitude_A=degrees
+Units Longitude_B=minutes
+Units Speed=knots
+Units Course=degrees
+Units MagVar=degrees
+Units FixQual=code
+Units NumSats=count
+Units Altitude=meters
+Units PPS=microseconds
+Units SecSinceGPRMC=seconds
+Units GPSReady=count
+Units MaxClockChange=milliseconds
+Units NumClockChange=count
+
+'============================================================
+' DEFINE DATA TABLES ========================================
+'============================================================
+
+Const TableName_Tower1_FastData = "PEAB_Fast"
+Const FileName_Tower1_FastData = "CRD:" & TableName_Tower1_FastData & "_"
+Public LastWrittenFile_Tower1_FastData As String * 40
+ReadOnly LastWrittenFile_Tower1_FastData
+
+'Const TableName_Tower1_WindData = "PEAB_Wind"
+'Const FileName_Tower1_WindData = "CRD:" & TableName_Tower1_WindData & "_"
+'Public LastWrittenFile_Tower1_WindData As String * 40
+'ReadOnly LastWrittenFile_Tower1_WindData
+
+Const TableName_Tower1_SlowData = "PEAB_Slow"
+Const FileName_Tower1_SlowData = "CRD:" & TableName_Tower1_SlowData & "_"
+Public LastWrittenFile_Tower1_SlowData As String * 40
+ReadOnly LastWrittenFile_Tower1_SlowData
+
+
+Const FileInterval_FastData = 24     '[h], create four files per day 'with a data rate of 10Hz, it produces 432'000 records per file
+Const FileInterval_SlowData = 24     'Don't create new files
+'Const FileInterval_WindData = 24     '[h], create one file per day 'with 60s data period, it would produce 17'280 records per file
+Const FileTimeOnInt = 0              'new file at midnight
+
+
+'---------------------------------------------------------
+' FAST Table ---------------------------------------------
+DataTable(FAST,True,-1)
+  DataInterval(0,OFREQ1,mSec,0)
+  TableFile(FileName_Tower1_FastData,64,-1,FileTimeOnInt,FileInterval_FastData,hr,0,LastWrittenFile_Tower1_FastData)  
+  Sample(4,Ux_5m,IEEE4)        ' Ux_5m, Uy_5m, Uz_5m, Ts_5m
+  Sample(1,diag_csat_5m,UINT2) ' CSAT diagnostic word. Store as unsigned integer
+EndTable
+
+'---------------------------------------------------------
+' SLOW Table ---------------------------------------------
+DataTable(SLOW,True,-1)
+  DataInterval(0,OFREQ2,Sec,0)
+  TableFile(FileName_Tower1_SlowData,64,-1,FileTimeOnInt,FileInterval_SlowData,hr,0,LastWrittenFile_Tower1_SlowData) 
+	'Sample(1,NMEASent(1),String)
+	'Sample(1,NMEASent(2),String)
+	'Sample(1,Latitude_A,FP2)
+	'Sample(1,Latitude_B,FP2)
+	'Sample(1,Altitude,FP2)
+	'Sample(1,PPS,FP2)
+	'Sample(1,SecSinceGPRMC,FP2)
+	'Sample(1,MaxClockChange,FP2)
+	'Sample(1,NumClockChange,FP2)
+
+  'LOGGER-----------------------------------------
+  Minimum(1,BattV_B,FP2,False,False)
+  Average(1,PTemp_B,FP2,False)
+  
+  'HygroVUE10-------------------------------------
+  Average(1,Temp_5m,FP2,False)
+  Average(1,RH_5m,FP2,False)
+  
+  'SI-111-----------------------------------------
+'  Sample(1,SBTempK,FP2)
+'  Sample(1,SFTempK,FP2)
+  
+  'CS320------------------------------------------
+  Sample(1,SWdn_5m,FP2)
+  Sample(1,CS320_T_5m,FP2)
+  
+  'YOUNG Wind Monitor-----------------------------
+  'WindVector(1,WS_5m,WD_5m,FP2,False,0,0,0)
+  'FieldNames("WS_5m_S_WVT,WD_5m_D1,WD_5m_SD1")
+  Average(1,WS_5m,FP2,False)        ' mean over OFREQ2 interval (here 1min)
+  Maximum(1,WS_5m,FP2,False,False)  ' max. over a 1sec interval (wind gust)
+  StdDev(1,WS_5m,FP2,False)         ' Std. over OFREQ2 interval (here 1min)
+  'Sample(1,WD_5m,FP2) Disconect wind direction to fit 
+
+  'CSAT3 & LI-7500A-------------------------------
+  Average(4,Ux_5m,IEEE4,False)
+  StdDev(1,Ux_5m,IEEE4,False)
+  
+  'Sample (1,wnd_dir_compass_5m,IEEE4)
+  'Sample (1,wnd_dir_csat3_5m,IEEE4)
+  'Sample (1,wnd_spd_5m,IEEE4)
+  'Sample (1,rslt_wnd_spd_5m,IEEE4)
+  'Sample (1,std_wnd_dir_5m,IEEE4)
+
+  Totalize(1,n_5m,IEEE4,NOT(disable_flag_on_5m(1) OR disable_flag_on_5m(2)))
+  FieldNames("csat_warnings_5m")
+  'Totalize(1,n_5m,IEEE4,NOT(delT_f_5m) OR NOT disable_flag_on_5m(2))
+  'FieldNames("delT_f_Tot_5m")
+  'Totalize(1,n_5m,IEEE4,NOT(sigl_f_5m) OR NOT disable_flag_on_5m(2))
+  'FieldNames("sigl_f_Tot_5m")
+  'Totalize(1,n_5m,IEEE4,NOT(amph_f_5m) OR NOT disable_flag_on_5m(2))
+  'FieldNames("amph_f_Tot_5m")
+  'Totalize(1,n_5m,IEEE4,NOT(ampl_f_5m) OR NOT disable_flag_on_5m(2))
+  'FieldNames("ampl_f_Tot_5m")
+  
+EndTable
+
+
+''*** Working Data Tables ***
+''Compute the wind direction This data is output every OUTPUT_INTERVAL minutes.
+'DataTable (wnd_vec,TRUE,1)
+'  DataInterval (0,OFREQ2,Min,1)
+'  'Compute wind direction from CSAT3 data.
+'  WindVector (1,wind_east_5m,wind_north_5m,IEEE4,disable_flag_on_5m(1),0,1,2)
+'  WindVector (1,Uy_5m,Ux_5m,IEEE4,disable_flag_on_5m(1),0,1,2)
+'EndTable 
+
+
+'==========================================================
+' MEASUREMENTS ============================================
+'==========================================================
+' Main Program
+BeginProg
+  
+  'Open serial port for GPS
+  SerialOpen(GPSPort,38400,3,0,1001)
+
+	'Set all CSAT3 variables to NaN.
+	Move(Ux_5m,5,NaN,1)
+
+	'Set the SDM clock speed.
+	SDMSpeed(SDM_PER)
+
+	n_5m = 0
+
+	'Main Scan+++++++++++++++++++++++++++++++++++++++++++++++
+	Scan(SFREQ1,mSec,10,0)	  
+
+		SDMTrigger()
+
+		'***Measure CSAT3 and LI7500-------------------------
+		
+		'Get data from CSAT3, 98: Get wind & sonic temperature data after a group trigger 
+		' CSAT_OPT: 10Hz execution parameter
+		CSAT3(Ux_5m,1,CSAT3_address_5m,98,CSAT_OPT)
+
+		'CSAT3 processing------------------------------------
+		'Define 61502 as NaN
+		If (diag_csat_5m = NaN) Then 
+  		(diag_csat_5m = 61502)
+  		Ux_5m = NaN
+  		Uy_5m = NaN
+  		Uz_5m = NaN
+  		Ts_5m = NaN
+		EndIf  
+		
+		'Break up the 4 CSAT3 warning flags in 4 separate bits
+		diag_csat_work_5m = diag_csat_5m
+		delT_f_5m = diag_csat_work_5m AND &h8000
+		sigl_f_5m = diag_csat_work_5m AND &h4000
+		amph_f_5m = diag_csat_work_5m AND &h2000
+		ampl_f_5m = diag_csat_work_5m AND &h1000
+
+		'Turn on the intermediate processing disable flag when any CSAT3 warning flag is
+		'high, including the special cases NaN (61502), a Lost Trigger (61440), No Data
+		'(61503), an SDM error (61441), or wrong CSAT3 embedded code (61442).
+		disable_flag_on_5m(1) = diag_csat_work_5m AND &hf000
+		'Turn on only when CSAT3 diagnostic warning flags are set.
+		disable_flag_on_5m(2) = (disable_flag_on_5m(1) AND NOT (Ts_5m=NaN))
+
+		'Save the four most significant bits of the CSAT3 diagnostics, except for the
+		'special cases NaN (61502), a Lost Trigger (61440), No Data (61503), an SDM
+		'error (61441), or wrong CSAT3 embedded code (61442).
+		If (diag_csat_work_5m<&hf000) Then 
+		  diag_csat_5m = INT(diag_csat_work_5m/&h1000)
+		EndIf
+
+		' Call data tables and store Fast Data-----------------
+		CallTable FAST
+		
+		'*** Measure the YOUNG Wind Monitor-------------------------------
+		'--- rd(pulse)=P1, gn=H1, bl=VX1, bk/gy/wh(GD)=G, cl=G | Multiplier depend on the model 05103/05106 = 0.0980, 05108=0.1666 and 05305=0.1024
+		'Measure wind speed as a mean of the last second (1000ms) 
+		PulseCount(WS_5m,1,U10,5,1,Young_mult,0)
+		
+		CallTable SLOW
+		'PulseCount instruction not allowed in SlowSequence
+		
+	NextScan 
+  
+  
+	'++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+	SlowSequence
+	
+	Scan (SFREQ2,Sec,5,0)
+	  
+		'*** Measure the GPS using the Serial instruction-----------------
+		'--- rd=12V, wh(RX)=RS-232, gr(TX)=RS-232, bk/ye/bl=G
+		'GPS(GPSData(),-ComC5,0,100,NMEASent())
+		GPS(GPSData(),-COMU1,0*3600,500,NMEASent())
+
+		'Get logger time
+		RealTime(LoggerTime_B)
+
+		'*** Measure the Datalogger Battery Voltage-----------------------
+		Battery(BattV_B)
+
+		'*** Measure the Datalogger Wiring Panel Temperature--------------
+		PanelTemp(PTemp_B,60)
+		
+		'*** Measure the HMP45 variables (substitute HYGROVUE10(--------------------------------
+		'--- br(energy)=12V, wh(data)=U11, bk(GD)=G, cl(Shield)=G
+		'Query sensor for 4 SDI-12 outputs.  Default address for all Decagon Digital sensors is 0. 
+		SDI12Recorder(HygroVUE10_5m,U11,HygroVUE_address_5m,"M!",1,0)
+		'SW12(SW12_1,1)
+		'Delay(0,150,mSec)
+		'VoltSe(Temp_5m,1,mV1000,U3,False,0,50,0.1,-40)
+		'VoltSe(RH_5m,1,mV1000,U4,False,0,50,0.1,0)
+		'If RH_5m>100 AND RH_5m<108 Then RH_5m=100
+		'SW12(SW12_1,1)
+		
+		'*** Measure the CS320 variables (SDI-12 address: 2)
+		'--- rd(energy)=12V, wh(data)=U11, bk(GD)=G, bl(GD)=G, cl(Shield)=G
+		SDI12Recorder(CS320_5m(),U11,CS320_address_5m,"M4!",1,0)
+		
+		'*** Measure SI-111 variables-------------------------------------
+		' --- Dest, Reps, SEChan, ExChan, SettlingTime, fN1, Mult, Offset
+		' *** Measurement of sensor body temperature with inbuilt thermistor
+'		Therm109(SBTempC,1,U5,U6,0,_60Hz,1,0)
+		' --- Dest, Reps, Range, DiffChan, RevDiff, SettlingTime, fN1, Mult, Offset
+		' *** Measurement thermopile detector (red = Sig+ = U7, sw = Sig- = U8)
+'		VoltDiff(TargmV,1,mV5000,U7,True,0,_60Hz,1,0)
+		' Calculation of m (slope) and b (intercept) coeffs for target temp calculation
+'		m = mC2 * SBTempC^2 + mC1 * SBTempC + mC0
+'		b = bC2 * SBTempC^2 + bC1 * SBTempC + bC0
+		' Calculation of target temperature
+'		SBTempK = SBTempC + 273.15
+'		SFTempK = ((SBTempK^4) + m * TargmV + b)^0.25
+		
+		'*** Measure the YOUNG Wind Monitor-------------------------------
+		'--- rd(pulse)=P1, gn=H1, bl=VX1, bk/gy/wh(GD)=G, cl=G | Multiplier depend on the model 05103/05106 = 0.0980, 05108=0.1666 and 05305=0.1024
+		'Measure wind direction
+		BrHalf(WD_5m,1,mV5000,U3,U5,1,2500,True,20000,60,355,0)
+		'If WD_5m>=360 OR WD_5m<0 Then WD_5m=0
+		'PulseCount instruction not allowed in SlowSequence
+
+	CallTable SLOW
+  
+	NextScan
+
+	EndSequence
+
+EndProg
