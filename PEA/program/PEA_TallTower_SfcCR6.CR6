@@ -1,8 +1,10 @@
 ' ---------------------------------------------------------
 ' CR6 Series
 ' Program: Antarctic Station 1 BASE (CR6 S/N: 1154)
-' Authors: Hendrik Huwald, Nander Wever, Armin Sigmund, EPFL
-' Date: 27.09.2022
+' Authors: Sergi Gonzalez, SLF
+' Modification of the program PEA_station_2023.CR6 of Hendrik Huwald, Nander Wever, Armin Sigmund, EPFL (27.09.2022)
+' Included from the last version: Change LICOR SDI adress, Delete SI-111 (now at CR6_B), Change Wind1 PPT
+' Date: 29.01.2025
 '
 ' Program measures:
 '  1x CSAT3 3D sonic anemometer at 10Hz
@@ -158,8 +160,8 @@ Dim diag_csat_work As Long
 
 ' LI7500---------------------------------------------------
 
-Const LIC75_address = 14  'Licor #4, SDM: 14 (Station 1) BASE
-'Const LIC75_address = 12  'Licor #2, SDM: 12 (Station 2) PLAT
+'Const LIC75_address = 14  'Licor #4, SDM: 14 (Station 1) BASE
+Const LIC75_address = 12  'Licor #2, SDM: 12 (Station 2) PLAT
 
 Public LIC75(4) As Float  'Licor output mode set equal to 6 !!!
 
@@ -178,12 +180,12 @@ Units LI_diag = none
 ' SI-111 constants (FROM CALIBRATION SHEET!)
 
 ' S/N:5661 (Station 1):
-Const mC2 = 77121.6
-Const mC1 = 7333840
-Const mC0 = 1262700000
-Const bC2 = 3459.13
-Const bC1 = 169383
-Const bC0 = -7469000
+'Const mC2 = 77121.6
+'Const mC1 = 7333840
+'Const mC0 = 1262700000
+'Const bC2 = 3459.13
+'Const bC1 = 169383
+'Const bC0 = -7469000
 
 ' S/N:5663 (Station 2):
 'Const mC2 = 78619.4
@@ -194,7 +196,7 @@ Const bC0 = -7469000
 'Const bC0 = -5975200
 
 ' GPS
-Const GPSPort = ComRS232
+Const GPSPort = ComU1
 Public RMCstring As String * 500
 'rmc variables
 'Public rmcid As String
@@ -361,8 +363,8 @@ DataTable(STN1OneMin,True,MaxLines_OneMin)    '32 columns in this table, incl. t
   Sample(1,RH,FP2)
   Sample(1,HS_Cor,FP2)
   Sample(1,HS_Qty,FP2)
-  Sample(1,SBTempK,FP2)
-  Sample(1,SFTempK,FP2)
+  'Sample(1,SBTempK,FP2)
+  'Sample(1,SFTempK,FP2)
   Sample(4,NetRad1,IEEE4) 'all 4 radiation components of upper net radiometer
   Sample(4,NetRad2,IEEE4) 'all 4 radiation components of lower net radiometer
   Sample(1,SWdn,FP2)
@@ -451,7 +453,7 @@ BeginProg
     ' --- Dest, Reps, PChan, PConfig, POption (0=Counts, 1=Frequency Hz), Mult, Offset
     ' *** Measure RMYoung wind------------------------------
     PulseCount(WS1,1,U12,5,1000,0.1666,0)	'Young 1
-    PulseCount(WS2,1,U11, 5,1000,0.1666,0)	'Young 2
+    PulseCount(WS2,1,U8, 5,1000,0.1666,0)	'Young 2
 
     CallTable STN1wind
 
@@ -608,30 +610,30 @@ BeginProg
     ' YOUNG1 (WD only)
     ' --- Dest, Reps, Range, SEChan, ExChan, MeasPEx, ExmV, RevEx, Settlingtime, fN1, Mult, Offset
     ' *** Measurement
-    BrHalf(WD1,1,mV5000,U3,U5,1,2500,True,20000,60,355,0) '20000 seems long, normally 0-500usec...
-    ' If WD1>=360 Then WD1=0
-    ' If WD1<0 Then WD1=0
+    BrHalf(WD1,1,mV5000,U3,U6,1,2500,True,20000,60,355,0) '20000 seems long, normally 0-500usec...
+    If WD1>=360 Then WD1=0
+    If WD1<0 Then WD1=0
 
     ' YOUNG2 (WD only)
     ' --- Dest, Reps, Range, SEChan, ExChan, MeasPEx, ExmV, RevEx, Settlingtime, fN1, Mult, Offset
     ' *** Measurement
-    BrHalf(WD2,1,mV5000,U4,U5,1,2500,True,20000,60,355,0) '20000 seems long, normally 0-500usec...
-    ' If WD2>=360 Then WD2=0
-    ' If WD2<0 Then WD2=0
+    BrHalf(WD2,1,mV5000,U4,U6,1,2500,True,20000,60,355,0) '20000 seems long, normally 0-500usec...
+    If WD2>=360 Then WD2=0
+    If WD2<0 Then WD2=0
 
     ' SI-111
     ' --- Dest, Reps, SEChan, ExChan, SettlingTime, fN1, Mult, Offset
     ' *** Measurement of sensor body temperature with inbuilt thermistor
-    Therm109(SBTempC,1,U6,U5,0,_60Hz,1,0)
+    'Therm109(SBTempC,1,U6,U11,0,_60Hz,1,0)
     ' --- Dest, Reps, Range, DiffChan, RevDiff, SettlingTime, fN1, Mult, Offset
     ' *** Measurement thermopile detector (red = Sig+ = U7, sw = Sig- = U8)
-    VoltDiff(TargmV,1,mV5000,U7,True,0,_60Hz,1,0)
+    'VoltDiff(TargmV,1,mV5000,U7,True,0,_60Hz,1,0)
     ' Calculation of m (slope) and b (intercept) coeffs for target temp calculation
-    m = mC2 * SBTempC^2 + mC1 * SBTempC + mC0
-    b = bC2 * SBTempC^2 + bC1 * SBTempC + bC0
+    'm = mC2 * SBTempC^2 + mC1 * SBTempC + mC0
+    'b = bC2 * SBTempC^2 + bC1 * SBTempC + bC0
     ' Calculation of target temperature
-    SBTempK = SBTempC + 273.15
-    SFTempK = ((SBTempK^4) + m * TargmV + b)^0.25
+    'SBTempK = SBTempC + 273.15
+    'SFTempK = ((SBTempK^4) + m * TargmV + b)^0.25
       
     ' HygroVUE10 (SDI-12 address: 0)
     ' --- Dest, SDIPort, SDIAddress, SDICommand, Mult, Offset
