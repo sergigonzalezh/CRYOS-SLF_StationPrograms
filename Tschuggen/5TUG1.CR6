@@ -1,0 +1,1090 @@
+'*************************************************************************************
+'* Tschuggen - Meteostation                                                        
+'*   Consisting the station at the Tschuggen Fluela, next to Fluelastrasse
+'*   near Gasthaus Tschuggen
+'*   
+'*   
+'*************************************************************************************
+'* program:  5STUG1.CR6
+'* author:   T. Hartmann, M. Hohl, DL
+'* 
+Public StrRev As String * 6 = "v1.1.1"
+'*************************************************************************************
+'* revision history:
+'*    v1.1.1 17.11.2025
+'*           SHM31, removed the 30min heating interval,
+'*           since it never became active with a 2-minute offset in the 5-minute slow scan
+'*           added BattThreshold for heating
+'*    v1.1.0 10.10.2025 DL
+'*           removed Geolux LX-80S
+'*           new sensor SHM31 Laser Snowheigt on SDI12,
+'*           integration as in the new snow station NSM 
+'*    v1.0.0 01.04.2024 partly copied from example programs from campbell
+'*    v0.0.1            copy parts from Braemabuehl station
+'*************************************************************************************
+'* sensors:  1 x Irgason combined gas analyzer and ultrasonic anemometer, Pwr U12
+'*           1 x SN50ss Apogee digital radiation balance sensor, Pwr U8
+'*           3 x Campbell HygroVUE10(air temp. & rel.hum)
+'*           1 x SnowSorfSDI Waljag (IR-snow surface temperature)
+'*           1 x Axis network Camera M3115-LVE witch Mobotix POE injector 
+'*                MX-NPA-PoE-RJ controlled via Mobile Router
+'*           1 x Mobile-Router power controlled by logger
+'*           1 x ClimaVue 10 compact digital weathersensor
+'*           1 x SnowVue10 digital snow hight sensor (or similiar)
+'*           1 x Flow Capt FC4 solid particle flux intensities and wind speeds
+'*           1 x GPS Antenna GPS16x
+'*           1 x Faro laser scanner (periodically mounted)
+'*           1 x Snow particle counter SPC (periodically mounted)
+'*           1 x FARO Laserscanner (periodically mounted)
+'*           1 x Windows PC to controll FARO Laserscanner
+'*           1 x SHM31 Laser Snowheight
+'*************************************************************************************
+'* use instructions and functional description:
+'*  - 
+'*  - the modem is driven only multiple times a day 
+'*  - the loggers clock can be synchronised automatically over GPS
+'*  - twice a month, on first and on 15th day at 12 o'clock or startup, station status is stored
+'*  - as the standard at SLF, the logger runs on wintertime (UTC+1)
+'*************************************************************************************
+
+'***   general constants   ***********************************************************
+Const KelvinToCelsius = -273.15      'for conversion from °K to °C, +273.15°
+Const toKiloB = 2^10                 ' = 1024, for conversion from B to kB
+Const MeterToCenti = 100             'for conversion from meters to centimeters
+
+Const SensorOffValue = 6999          'kind of NaN indicating sensor is switched off
+Const SensorErrorValue = 6998        'indicationg sensor has an error
+
+Const T_Start = 0 : Const Reset_Start = 2 : Const Stop_Reset = 3 : Const Read_only = 4
+  'options for the use of timer, instead of using the numbers
+
+Const NO_ON = 1  : Const NO_OFF = 0     'for switches, normally open
+Const NC_ON = 0 : Const NC_OFF = 1      '  or normally closed
+
+Const ControlTerminal = 0 : Const UniversalTerminal = 1
+
+Const LF = CHR(10)         'ASCII-value for a Line Feed
+Const CR = CHR(13)         'ASCII-value for a Carriage Return
+Const QM = CHR(34)         'ASCII-value for a quotation mark
+
+
+'***   constants & configuration settings   ******************************************
+ConstTable
+  '***   program control (conditional compilation)   *********************************
+  Const TESTING = False              'some variables are visible for troubleshooting
+  Const MainScanInterval = 60         'interval of main scan-loop in [s]
+  Const SlowScanInterval = 5         'interval of slow sequence scan in [min]
+  Const FastScanIntervall = 50        ' [mSec] fast output (LI7500, 20Hz)
+  Const MeasureMeteoInterval = 60    'interval of meteodata measurement [s]
+  Const MeteoRecordInterval = 10     'interval of stored data records [min]
+  Const ServiceRecordInterval = 30   'interval for general service data [min]
+  Const StatusRecordInterval = 1     'interval for status-table call [mon]
+  Const StatusTimeOnInt1 = 43200     'time into interval [s], first day at noon
+  Const StatusTimeOnInt2 = 1339200   'time into interval [s], 15th day at noon
+  Const ResetForceMeasurement = 60   'interval to check and if needed reset flag [min]  
+
+  Const SnowSurfTemp_minVal = -40.0  'minimum possible value for snow surface
+  Const SnowSurfTemp_maxVal = 55.0   'maximum possible value for snow surface
+  
+  Const SensorsPwrPort = SW12_2      'power of the Station except logger
+  Const IRGASON_normalOutCMD = 1     'EC100-command for normal output - Ux,Uy,Uz,Ts,
+        'sonic diag,CO2,H2O,gas diag,ambient temp,ambient pressure,CO2 signal,H2O signal
+
+  Const IRGASON_SDMaddr = 1          'SDM-address of IRGASON 
+  Const IRGASON_SDMport = U9         'SDM-port used for the IRGASONs
+  Const IRGASON_PwrPort = U12
+        
+  Const ModemSigQualInterval = 30    'read the modems signal strength interval [min]
+  Const ModemSigQualTime = 28        'measure signal strength at 28th and 58th [min]
+  Const ModemPwrPort = SW12_1         'power of cellular router, solid-state relay No, ON SW12
+  Const ModemPwrOption = 5             'parameter used for IPNetPower-function
+  
+  Const BattMin_Time = 15            'record batterys minimum over this time [min]
+  
+  Const HygroVUE10_enableRHrelIceCorr = True   'enable correction, humidity above ice
+  Const HygroVUE10_thresholdRHrelIceCorr = -0.0 'correct humidity for temps below [°C]
+  Const HygroVUE10_SDIPort = C3      'data channel for HygroVUE10 TaRH-sensor
+  Const SnowSurf_SDIPort = C1        'data channel for Waljag snow surface sensor
+  Const SnowSurfSDI_Offset = 0
+  
+  Const BattThresholdCritical = 11.0
+  Const Irgason_BattThreshold = 11.3
+  Const Modem_BattThreshold = 11.5
+  Const Spc_BattThreshold = 11.8
+  Const Laserscanner_BattTreshold = 12.0
+  Const SN500SS_HeatBattThreshold = 12.3       'if battery drops below, don't heat [V]
+  Const SHM31_DefrostBattThreshold = 12.3      'if battery drops below, don't defrost [V] (Minimum heating remains active)
+  
+  Const SN500SS_HeatTime = 5         'heat sensor for time [min] (depending on scan)
+  Const SN500SS_HeatDeadTime = 90    'after heating, don't heat anymore for [min
+  Const SN500SS_HeatTempThreshold = 2          'heat if air temp is below [°C]
+  Const SN500SS_HeatHumThreshold = 90          'heat if humidity is above [%]
+  Const SN500SS_HeatRadMinThreshold = 100      'heat if SWin radiation is below [W]
+  Const SN500SS_RadMinTimewindowInt = 1440     'check for minimal radiation from
+  Const SN500SS_RadMinTimewindowStart = 570    '  9:30 to 14:30 local time
+  Const SN500SS_RadMinTimewindowStop = 870
+  Const SN500SS_PwrPort = U8  
+  
+  Const SN500SS_SDIPort = U1                   'data channel for the radiation sensor
+  Const FlowCaptSDIPort = U5                   'data port for FlotCapt
+  Const ClimaTRH_SDIPort = U3                  'data channel for ClimaVUE50, CS215 & HygroVUE10
+  Const GPSPort = ComRS232                     'Com port where GPS is connected
+  Const SHM31_SDIPort = U7
+  Const SpcPwrPort = C2                        'power SPC exgernal supply
+  Const LaserPwrPort =  C4              'power FARO FOCUS S120 Laserscanner
+  Const LaserPcPwrPort = U6             'power PC to control FARO Laserscanner
+  Const LaserScanNotFinishedMask = &B10
+  Const LaserPowerDownPort = U4
+EndConstTable
+
+'***   constants for binary codes status variable   **********************************
+Const TaRH1_off        = 2^0
+Const TaRH1_error      = 2^1
+Const TaRH2_off        = 2^2
+Const TaRH2_error      = 2^3
+Const TaRH3_off        = 2^4
+Const TaRH3_error      = 2^5
+Const SnowSurf_off     = 2^6
+Const SnowSurf_error   = 2^7
+Const WindMeasure_off  = 2^8
+Const SN500SS_off      = 2^9
+Const Spc_off          = 2^10
+Const Laser_off        = 2^11
+Const SensorPwr_off    = 2^12
+
+
+'***   constants for timer       ******************************************************
+Const Timer_ClimaVueTRHFC4_Reset = 2 'timer for sensors reset
+Const Timer_SN500SS_Reset = 3        'timer for sensors reset
+Const Timer_SN500SS_Heater = 4       'timer to control the sensors heating
+
+'***   set station specific parameters   *********************************************
+StationName (Tschuggen)                   'assign stations name to the logger
+Public ModemInterval = 60       'interval  [min]
+Public ModemStartTime = 0      'enable Router every hour, Start at 0 
+Public ModemEndTime = 15        'disable Router after 15 min
+Public ModemPwrManual As Boolean = True
+
+Public ModemCheckSigInterval = 60
+Public ModemCheckSigStartTime = 5
+Public ModemCheckSigEndTime = 10
+
+Public LaserPowerInterval = 1440
+Public LaserPowerStartTime = 665 
+Public LaserPowerEndTime = 675
+Public LaserPwrManual As Boolean = False
+Public LaserScanNotFinished As Boolean = True
+Public LaserPcPwrManual As Boolean = False
+
+Public DisableLaser As Boolean = True
+
+Public DisableSpc As Boolean = False
+
+Public waitForOneMainScanIntervalOver As Boolean = False
+ReadOnly waitForOneMainScanIntervalOver
+
+
+'---  constants for table handling   ------------------------------------------
+Const TableName_Meteo = "Tschuggen_Meteo"
+Const TableName_Service = "Tschuggen_Service"
+Const TableName_Status = "Tschuggen_Status"
+Const TableSize_Meteo = -1           'use remaining memory for records of meteo-
+Const TableSize_Service = -1         '  and for service data
+Const TableSize_Status = 100         'recorded twice a month, space more than 4 years
+
+
+'***   further conditional and miscellaneous parameters   ****************************
+Const IPinterface = 1                'constant for IP-reading of PPP-interface
+Const NTPserver As String = "0.ch.pool.ntp.org"          'server for clock adjustment
+  'neither ntp1.slf.ch nor its address 195.176.244.113 worked for NTP-adjustment
+Const UTCoffset = 3600               'CET without CEST = UTC+1 [s]
+Const NTPmaxDev = 5000               'maximal time deviation without adjustment [ms]
+Const NTPinterval = 1440             'synchronise clock once a day [min]
+Const NTPtimeOnInt = 722             'synchronise clock at 12:00 CET [min]
+Const NTPTimeOnIntEnd = 735          'stop at 12:15 CET [min]
+
+Const RouterPW = "EC02FF05E089E0E9C7E8FE12b86F4282"    ' password for http request
+Const IP_RUTModuleRouter = "192.168.1.1"  'router IP
+Const URI_RUTModuleRouter = "http://192.168.1.1/ubus"
+Const RUTModuleHeader = "Content-Type: application/json"
+Const RUTModuleContent = "{"+QM+"jsonrpc"+QM+":"+QM+"2.0"+QM+", "+QM+"id"+QM+":1, "+QM+"method"+QM+":"+QM+"call"+QM+", "+QM+"params"+QM+":[ "+QM+"00000000000000000000000000000000"+QM+", "+QM+"session"+QM+", "+QM+"login"+QM+", {  "+QM+"username"+QM+":"+QM+"admin"+QM+", "+QM+"password"+QM+":"+QM+"EC02FF05E089E0E9C7E8FE12b86F4282"+QM+"}]}"
+Public get_success = 0               ' Variable if HTTPGet is successful 
+Public responseString As String * 1000 'String to store HTTPGet information
+Public cutString As String * 560
+Public RUTUbusRpcSession As String * 560
+
+'***   variables for user control   **************************************************
+Public ForceMeasurements As Boolean = False             'flag to force measurements
+Public EnableWindMeasure As Boolean = True              'enable wind measurement (IRGASON)
+Public EnableTaRhMeasure As Boolean = True              'enable tempAir & relHum
+Public EnableSnowSurfaceMeasure As Boolean = True       'enable snow surface measurm.
+Public SensorPowerEnable As Boolean = True                'enable all sensors
+
+Public DisableSN500SS As Boolean = False
+
+'***   variables for measured values   ***********************************************
+'***   service variables   ***********************************************************
+Public LoggerTemp : Units LoggerTemp = °c      'system variables
+Public BatteryVoltage : Units BatteryVoltage = V
+Public BatteryVoltage_min : Units BatteryVoltage_min = V
+Const BattMin_RunNr = BattMin_Time * 60 / MainScanInterval
+  '  minimum of the battery voltage, BattMin_Time [min] & MainScanInterval [sec]
+Public ModemNetTech As String * 10   'holds used technology, LTE (4G), WCDMA (3G) or 2G
+Public ModemSigQual(3) = {NaN,NaN,NaN}
+Alias ModemSigQual = ModemRSSI, ModemRSRP, ModemRSRQ
+Units ModemRSSI = dBm : Units ModemRSRP = dBm : Units ModemRSRQ = dB
+  'signal quality is respresented, with 2G by RSSI and with 4G by RSRP and RSRQ
+'Public LoggerIP As String            'holds the IP after successful mobile connection
+'Public LoggerNTPdeviation : Units LoggerNTPdeviation = ms
+  'storing loggers clock deviation after a NTP-check, prior to a clock adjustment
+'Public LoggerNTPdevMax = 0 : Units LoggerNTPdevMax = ms  'maximum clock deviation
+'Public NTPsyncEnable As Boolean = True       'en- or disable clock-synchronisation over NTP
+'Public TestEnabled As Boolean : ReadOnly TestEnabled     'to show test mode
+
+'***   miscellaneous variables & constants   *****************************************
+Public Logger As String              'several status information about the system
+Public ProgramName As String * 50
+Public ProgStartTime As Long
+Public ProgramSignature, ProgramErrors, CalibErrors
+Public BackupBattery As String * 20
+Public CardsFreeMemory As Long = 0 : Units CardsFreeMemory = kB
+Public StatusActual As Long = 0      'actual status or running program, binary coded
+Public StatusDisabledSensors As Long = 0       'showing which senors are disabled
+
+Dim LoggersTime (9)                  'holds actual loggers time (year, month, day of month,
+  ' hour of day, minutes, seconds, microseconds, day of week, day of year)
+Alias LoggersTime (8) = Today      'actual day of the week (1-7; Sunday = 1)
+Alias LoggersTime (5) = Minute_act   'actual minute
+
+'***   constants & variables for 3x HygroVue10 Temp. rel. humidity  ****************
+'***   constants & variables for 3x HygroVue10 Temp. rel. humidity  ****************
+
+Const TaRH_HygroVUE10 = True         'for air temperature and relative humidity
+Const HygroVUE1_Address = "1"       'SDI12-address of HygroVUE10 TaRH-sensor
+Const HygroVUE2_Address = "2"       'SDI12-address of HygroVUE10 TaRH-sensor
+Const HygroVUE3_Address = "3"       'SDI12-address of HygroVUE10 TaRH-sensor
+Const HygroVUE10_ReadCMD = "M!"      'command for air temperature [°C] & humidity [%]
+Const HygroVUE10_RHrelIceCorr_multiplier = 0.0084   'parameters for humidity correction
+Const HygroVUE10_RHrelIceCorr_offset = 0.9964       '  above ice (freezing temperatures)
+  'for lower temperatures: RHreal = RHmeasured / (multiplier * TempActual + offset)
+'variables for the air temperature and relative humidity measurement (HygroVUE10)
+Public TaRHdataTemp(2) : Alias TaRHdataTemp = TempAir_act_Temp, RelHum_act_Temp
+Units TempAir_act_Temp = °C : Units RelHum_act_Temp = %
+Public TaRHdata1(2) : Alias TaRHdata1 = TempAir_act1, RelHum_act1
+Units TempAir_act1 = °C : Units RelHum_act1 = %
+Public TaRHdata2(2) : Alias TaRHdata2 = TempAir_act2, RelHum_act2
+Units TempAir_act2 = °C : Units RelHum_act2 = %
+Public TaRHdata3(2) : Alias TaRHdata3 = TempAir_act3, RelHum_act3
+Units TempAir_act3 = °C : Units RelHum_act3 = %
+
+'***   constants & variables for snow surface temp Waljag  ****************
+
+Const SnowSurfTemp_IRsensor = True
+Const SnowSurfSDI_Address = "5"
+Const SnowSurfSDI_ReadCMD = "M1!"
+'variables for Waljag SnowSurfSDI-sensor, IR-sensor for snow surface temperature
+Public SnowSurfSDI_data(2) : Units SnowSurfSDI_data() = °C
+Alias SnowSurfSDI_data = BodyTempSnowSurf_act, TempSnowSurf_act
+
+'***   constants & variables for irgason sonic wind   ****************
+Public sonic_irga(12)
+Alias sonic_irga(1) = Irga_Ux
+Alias sonic_irga(2) = Irga_Uy
+Alias sonic_irga(3) = Irga_Uz
+Alias sonic_irga(4) = Irga_Ts
+Alias sonic_irga(5) = Irga_diag_sonic
+Alias sonic_irga(6) = Irga_CO2
+Alias sonic_irga(7) = Irga_H2O
+Alias sonic_irga(8) = Irga_diag_irga
+Alias sonic_irga(9) = Irga_cell_tmpr
+Alias sonic_irga(10) = Irga_cell_press
+Alias sonic_irga(11) = Irga_CO2_sig_strgth
+Alias sonic_irga(12) = Irga_H2O_sig_strgth
+Units Irga_Ux = m/s
+Units Irga_Uy = m/s
+Units Irga_Uz = m/s
+Units Irga_Ts = C
+Units Irga_diag_sonic = arb
+Units Irga_CO2 = mg/m^3
+Units Irga_H2O = g/m^3
+Units Irga_diag_irga = arb
+Units Irga_cell_tmpr = C
+Units Irga_cell_press = kPa
+Units Irga_CO2_sig_strgth = arb
+Units Irga_H2O_sig_strgth = arb
+
+'***   constants & variables for snow drift sensor (particle counter)  ****************
+Const FlowCapt_Address = "0"         'SDI12-command of FlowCapt FC4 snow drift sensor
+Const FlowCapt_ReadCMD = "M!"        'SDI12-command to read all the data from sensor
+Public SnowDrift_FC4(8) : Alias SnowDrift_FC4 = SnowPartFluxMin, SnowPartFluxAvg,   SnowPartFluxMax, SnowPartFluxStd, SnowPartFluxCumul, WindSpeedMin_FC4,   WindSpeedAvg_FC4, WindSpeedMax_FC4
+Units SnowPartFluxMin = g/m²/s : Units SnowPartFluxAvg = g/m²/s
+Units SnowPartFluxMax = g/m²/s : Units SnowPartFluxStd = g/m²/s
+Units SnowPartFluxCumul = g/m² : Units WindSpeedMin_FC4 = km/h
+Units WindSpeedAvg_FC4 = km/h : Units WindSpeedMax_FC4 = km/h
+
+'***   constants & variables for four-component radiation sensor  ********************
+Const SN500SS_Address = "0"          'SDI12-address of SN-500-SS radiation sensor
+Const SN500SS_ReadCMD = "MC!"        'SDI12-command to read the sensors values
+Const SN500SS_HeatOnCMD = "XHON!"    'SDI12-command to switch the sensors heater on
+Const SN500SS_HeatOffCMD = "XHOFF!"  'SDI12-command to switch the sensors heater off
+Public RadNet_SN500SS(4) : Units RadNet_SN500SS() = W/m²
+Alias RadNet_SN500SS = ISWR, RSWR, ILWR, OLWR
+'ISWR = downwelling shortwave radiation [W/m²]
+'RSWR = upwelling (reflected) shortwave radiation [W/m²]
+'ILWR = downwelling longwave radiation [W/m²]
+'OLWR = upwelling (emitted) longwave radiation [W/m²]
+
+Public ISWRmax : Units ISWRmax = W/m²
+Const ISWRmax_RunNr = 30 / SlowScanInterval       'running maximum over ½ h
+Public SN500SS_HeaterActive As Boolean : ReadOnly SN500SS_HeaterActive
+Dim SN500SSSpecialCMDresponse As String * 30   'used for SDI12Recorder with commands
+Dim SN500SS_Heater_TimerValue
+
+'***   constants & variables for ClimaVUE50 weather sensor  **************************
+Const ClimaVueAddress = "1"          'SDI12-address of ClimaVUE50-sensor
+Const ClimaVue_StdReadCMD = "R7!"    'standard SDI12 read command for sensors values
+Const Clima_TRH_ReadCMD = "C!"       'read command for ClimaVUE50, CS215 & HygroVUE10
+
+Public ClimaVueData(14) : Alias ClimaVueData = SolarRad_ClimaVue, Precip_ClimaVue,   LightStrikesCnt, LightStrikesDist, WindSpeed_ClimaVue, WindDir_ClimaVue,   WindSpeedMax_ClimaVue, TempAir_ClimaVue, PresVapour, PresBaroAbs, RelHum_ClimaVue,   TempHumSens_ClimaVue, TiltNS_ClimaVue, TiltWE_ClimaVue 'values for R7!-SDI12-command
+Units SolarRad_ClimaVue = W/m² : Units Precip_ClimaVue = mm
+Units LightStrikesDist = km : Units WindSpeed_ClimaVue = m/s
+Units WindDir_ClimaVue = ° : Units WindSpeedMax_ClimaVue = m/s
+Units TempAir_ClimaVue = °C : Units PresVapour = hPa : Units PresBaroAbs = hPa
+Units RelHum_ClimaVue = % : Units TempHumSens_ClimaVue = °C
+Units TiltNS_ClimaVue = ° : Units TiltWE_ClimaVue = °
+Public Wind_ClimaVue_DataInvalid As Boolean    'to disable processing in datatable
+Dim LightStrikesDist_DataInvalid As Boolean    'if distance is 0, for minimal function
+
+'*** constants & variables for SHM31 *************************
+Const SHM31_StartupDelay = 60 'time for sensor to have good values [s]
+Const SHM31_SDIAddress = "1" 'SDI12-address of SHM 31 snow heigt sensor (Werksauslieferung war "0"!)
+'Const SHM31_ReadCMD = "M!" 'SDI12-command to read all data from the sensor
+Const SHM31_ReadCMD_0 = "R0!" 'SDI12-command read data buffer 0 from sensor
+Const SHM31_ReadCMD_1 = "R1!" 'SDI12-command read data buffer 1 from sensor
+Const SHM31_CalibCMD = "XARV!" 'SDI12-command for offset and angle calibration
+Const SHM31_CalibRESP = SHM31_SDIAddress & "XARVok" 'respond after the command
+'Const SHM31_ResetCMD = "XRES!" 'SDI12-command for a reset of the sensor
+'Const SHM31_SetHeatCtrlCMD = "XPHEP1!" 'SDI12-command to enable the heater control on the HeaterEnablePin / EXT_TRIG_IN
+Const SHM31_ResetHeatCtrlCMD = "XPHEP0!" 'SDI12-command to disable the heater control on the HeaterEnablePin / EXT_TRIG_IN
+Const SHM31_MeasIntervalCMD = "XPATI!" 'SDI12-command to read Measurement Intveral, Default: 60s
+Const SHM31_MeasIntervalChangeCMD = "XPATI+30!" 'SDI12-command to set Measurement Intveral, Default: 60s
+Const SHM31_LaserMeasIntervalCMD = "XPLMI!" 'SDI12-command to read Laser Measurment Interval, Default: 10000ms
+Const SHM31_LaserMeasIntervalChangeCMD = "XPLMI+5000!" 'SDI12-command to set Laser Measurment Interval, Default: 10000ms
+'Const SHM31_HeaterDefrostModeOn = "XPHDM1!" 'SDI12-command to enable heaterDefrost Mode
+	    '1=during sensor start (with values “HDP”, “HDR”, “HDB”, “HDW” for both heaters (block and window))	
+Const SHM31_DefrostStartCMD = "XHDS!" 'SDI12-command to start the defrost cycle
+'Const SHM31_DefrostStopCMD = "XHDE!" 'SDI12-command to stop the defrost cycle
+      'defrost mode can be used automatically at startup of the sensor or if the sensor
+      'shall be heated for a certain time, regardless the temperatures (with a higher
+      'temperature threshold) - it isn't used currently
+Const SHM31_ViewBlockedError = 15 'error code if signal is too weak
+Const SHM31_TempLaserLow = 23 'error code for laser temperature too low
+Public SHM31_DoCalibration As Boolean 'flag to execute a calibration of SHM31 sensor
+Public SHM31_ChangeParam As Boolean 'flag to execute a calibration of SHM31 sensor
+Public SHM31_Answer(8) : Alias SHM31_Answer = SHM31_Timestamp, SHM31_SnowHeight, SHM31_TempBlock, SHM31_TempAmbient, SHM31_TempLaser, SHM31_SignalQuality, SHM31_Tilt, SHM31_ErrorCode
+Units SHM31_Timestamp = s : Units SHM31_SnowHeight = mm : Units SHM31_TempBlock = °C
+Units SHM31_TempAmbient = °C : Units SHM31_TempLaser = °C : Units SHM31_Tilt = °
+Units SHM31_ErrorCode = code
+'Dim SHM31_Data(4) 'to store temporary data from sensor
+Const SHM31_Buffer0_Index = 1 'to access only first part of the data-array
+Const SHM31_Buffer1_Index = 5 'to access only second part of the data-array
+Public SHM31_SpecialCMDresp As String * 30 'used for SDI12Recorder with commands
+Public SHM31_MeasIntervalCMDresp As String * 30 'used for SDI12Recorder with commands, Default: 60s
+Public SHM31_LaserMeasIntervalCMDresp As String * 30 'used for SDI12Recorder with commands, Default: 10000ms
+Dim SHM31_DataInvalid As Boolean 'used to disable processing in datatable
+'Const Timer_SHM31_Heater = 5         'timer to control the sensors heating
+'Public SHM31_MeasurementInterval = 30
+'Public SHM31_LaserMeasurmentInterval = 5000
+'Dim SHM31_Heater_TimerValue
+Public SHM31_Defrost_count As Long = 0 'Diagnosis of the defrosting logic 
+
+'-------------    GPS   ----------------------------------------------------
+Const LOCAL_TIME_OFFSET = 1           'Local time offset relative to UTC time
+Dim nmea_sentence(2) As String *100
+Public gps_data(15)
+Alias gps_data(1) = latitude_a         'Degrees latitude (+ = North; - = South)
+Alias gps_data(2) = latitude_b         'Minutes latitude
+Alias gps_data(3) = longitude_a        'Degress longitude (+ = East; - = West)
+Alias gps_data(4) = longitude_b        'Minutes longitude
+Alias gps_data(5) = speed              'Speed
+Alias gps_data(6) = course             'Course over ground
+Alias gps_data(7) = magnetic_variation 'Magnetic variation from true north (+ = East; - = West)
+Alias gps_data(8) = fix_quality        'GPS fix quality: 0 = invalid, 1 = GPS, 2 = differential GPS, 6 = estimated
+Alias gps_data(9) = nmbr_satellites    'Number of satellites used for fix
+Alias gps_data(10) = altitude          'Antenna altitude
+Alias gps_data(11) = pps               'usec into sec of system clock when PPS rising edge occurs, typically 990,000 once synced
+Alias gps_data(12) = dt_since_gprmc    'Time since last GPRMC string, normally less than 1 second
+Alias gps_data(13) = gps_ready                  'Counts from 0 to 10, 10 = ready
+Alias gps_data(14) = max_clock_change  'Maximum value the clock was changed in msec
+Alias gps_data(15) = nmbr_clock_change 'Number of times the clock was changed
+
+'Define Units to be used in data file header
+Units latitude_a = degrees
+Units latitude_b = minutes
+Units longitude_a = degrees
+Units longitude_b = minutes
+Units speed = m/s
+Units course = degrees
+Units magnetic_variation = unitless
+Units fix_quality = unitless
+Units nmbr_satellites = unitless
+Units altitude = m
+Units pps = ms
+Units dt_since_gprmc = s
+Units gps_ready = unitless
+Units max_clock_change = ms
+Units nmbr_clock_change = samples
+'***   variables for table handling   ************************************************
+Public MeteoTableEnabled As Boolean = True     'flags to disable the storing of
+Public ServiceTableEnabled As Boolean = True   '  any records in a table
+Public StatusTableEnabled As Boolean = True
+Public TaRH1_disableTableProcess As Boolean        'flags to disable the processing
+Public TaRH2_disableTableProcess As Boolean        'flags to disable the processing
+Public TaRH3_disableTableProcess As Boolean        'flags to disable the processing
+Public SnowSurf_disableTableProcess As Boolean    ' (averaging etc.) of certain samples 
+Public Irga_disableTableProcess As Boolean
+
+'Define Data Tables
+DataTable(IrgaWindFast,True,-1)
+  DataInterval(0,FastScanIntervall,mSec,10)
+  'store data to card, make every 24h a new file, no file limit, if memory is full, auto delete the oldest one
+  TableFile ("CRD:IrgaWindFast",64,-1,0,24,hr,0,0) 'option 64 is TOB3 format, and can store more then 2Gb data
+  
+  Sample(1,Irga_Ux,IEEE4)
+  FieldNames ("Irga_Ux: IRGASON Ux [m/s]")
+  Sample(1,Irga_Uy,IEEE4)
+  FieldNames ("Irga_Uy: IRGASON Uy [m/s]")
+  Sample(1,Irga_Uz,IEEE4)
+  FieldNames ("Irga_Uz: IRGASON Uz [m/s]")
+  Sample(1,Irga_Ts,IEEE4)
+  FieldNames ("Irga_Ts: Sonic Temp [°C]")
+  Sample(1,Irga_diag_sonic,IEEE4)
+  FieldNames ("Irga_diag_sonic: Sonic Diagnostic Flag")
+  Sample(1,Irga_CO2,IEEE4)
+  FieldNames ("Irga_CO2: CO2 Density [mg/m³]")
+  Sample(1,Irga_H2O,IEEE4)
+  FieldNames ("Irga_H2O: H2O Density [g/m³]")
+  Sample(1,Irga_diag_irga,IEEE4)
+  FieldNames ("Irga_diag_irga: Gas Diagnostic Flag")
+  Sample(1,Irga_cell_tmpr,IEEE4)
+  FieldNames ("Irga_cell_tmpr: Air Temperature [°C]")
+  Sample(1,Irga_cell_press,IEEE4)
+  FieldNames ("Irga_cell_press: Air Pressure [kPa]")
+  Sample(1,Irga_CO2_sig_strgth,IEEE4)
+  FieldNames ("Irga_CO2_sig_strgth: CO2 Signal Strength")
+  Sample(1,Irga_H2O_sig_strgth,IEEE4) 
+  FieldNames ("Irga_H2O_sig_strgth: H2O Signal Strength")  
+EndTable
+
+DataTable (TableName_Meteo,MeteoTableEnabled,TableSize_Meteo)
+  'this table contains main meteo data from all sensors, processed (average etc.)
+  DataInterval (0,MeteoRecordInterval,min,10)
+  Average(4,Irga_Ux,IEEE4,Irga_disableTableProcess)
+  StdDev (4,Irga_Ux,IEEE4,Irga_disableTableProcess)
+  Sample (8,SnowDrift_FC4(),IEEE4)             'all values from Flow Capt FC4-sensor
+  FieldNames ("SnowPartFluxMin_FC4:minimum particle flux [g/m²/s],SnowPartFluxAvg_FC4:average particle flux [g/m²/s],SnowPartFluxMax_FC4:maximum particle flux [g/m²/s],SnowPartFluxStdDev_FC4:standard deviation particle Flux [g/m²/s],SnowPartFluxCumulated_FC4:cumulated particle flux [g/m²],WindSpeedMin_FC4:minimum wind speed [km/h],WindSpeedAvg_FC4:average wind speed [km/h],WindSpeedMax_FC4:maximal wind speed [km/h]")
+  WindVector (1,WindSpeed_ClimaVue,WindDir_ClimaVue,IEEE4,Wind_ClimaVue_DataInvalid,0,0,2)
+  FieldNames ("WindSpeedScalMean_ClimaVUE:mean scalar speed [m/s],WindSpeedVectMean_ClimaVUE:mean vector magnitude speed [m/s],WindDirVectMean_ClimaVUE:mean vector direction [°],WindDirStdDev_ClimaVUE:standard deviation direction [°]")
+  Maximum (1,WindSpeedMax_ClimaVue,IEEE4,Wind_ClimaVue_DataInvalid,False)
+  'maximum of recorded wind speed maximums
+  FieldNames ("WindSpeedMax_ClimaVUE:maximum wind speed [m/s]")
+  Average (1,SolarRad_ClimaVue,IEEE4,False)
+  FieldNames ("SolarRadiation_ClimaVUE:direct & diffuse incomming radiation [W/m²]")
+  Totalize (1,Precip_ClimaVue,IEEE4,False)     'sum up the measured precipitation
+  FieldNames ("Precipitation_ClimaVUE:precipitation [mm]")
+  Totalize (1,LightStrikesCnt,UINT2,False)     'sum up the counted lightning strikes
+  FieldNames ("CountLightningStrikes_ClimaVUE:lightning strikes [cnt]")
+  Minimum (1,LightStrikesDist,FP2,LightStrikesDist_DataInvalid,False)
+  'smallest distance of lightning strikes, if no strikes sensors gives 0, so disable
+  FieldNames ("DistanceLightningStrikes_min_ClimaVUE:nearest lightning strike [km]")
+  Average (5,ClimaVueData(8),IEEE4,False)      'sereval data from ClimaVUE50
+  FieldNames ("TemperatureAir_ClimaVUE50:air temperature ClimaVUE50 [°C],PressureVapour:vapour pressure ClimaVUE50 [hPa],PressureBarometricAbsolute:absolute barometric pressure ClimaVUE50 [hPa],RelativeHumidity_ClimaVUE50:relative humidity ClimaVUE50 [%],TemperatureHumiditySensor_ClimaVUE50:humidity sensors temperature ClimaVUE50 [°C]")
+  Sample (4,RadNet_SN500SS,IEEE4)    'four components of radiation measurement
+  FieldNames ("ISWR:downwelling shortwave radiation [W/m²],RSWR:upwelling (reflected) shortwave radiation [W/m²],ILWR:downwelling longwave radiation [W/m²],OLWR:upwelling (emitted) longwave radiation [W/m²]")
+  Average (1,TempSnowSurf_act,FP2,SnowSurf_disableTableProcess)
+  FieldNames("SnowSurfTemp: snow surface body temp [°C]")
+  Average (1,SensorOffValue,IEEE4, False) 'rel snow level Radar LX80S
+  FieldNames ("Geolux_ActRelSnowLevelF_Avg:rel snow level from radar avg [mm]")
+  Average (1,SensorOffValue,IEEE4, False) 'distance Radar LX80S
+  FieldNames ("Geolux_ActDistanceF_Avg:measured distance from radar avg [mm]")
+  Sample (1,SHM31_SnowHeight,IEEE4) 'snow height from SHM31
+  FieldNames ("SHM31_SnowHeight: snow height from SHM31 laser [mm]")
+  Sample (1,SHM31_SignalQuality,UINT2) 'normalised signal (quality) of SHM31
+  FieldNames ("SHM31_SignalQuality:normalised signal of SHM31 laser")  
+EndTable
+
+DataTable (TableName_Service,ServiceTableEnabled,TableSize_Service)
+  'this table contains service data, e.g. modems signal strength or recorded errors
+  DataInterval (0,ServiceRecordInterval,min,10)
+  Sample (1,LoggerTemp,FP2)
+  FieldNames ("TemperatureLogger:temperature of loggers panel [°C]")
+  Average (1,BatteryVoltage,FP2,False)
+  FieldNames ("BatteryVoltage:loggers supply voltage [V]")
+  Minimum (1,BatteryVoltage_min,FP2,False,False)
+  FieldNames ("BatteryVoltage_min:loggers supply voltag minimum [V]")
+  Sample (1,StatusActual,UINT2)      'binary coded status variable
+  FieldNames ("ActualStatus:actual status binary coded")
+  Sample (1,ModemNetTech,String)
+  FieldNames ("ModemNetTechnology:net used by modem (LTE/WCDMA)")
+  Sample (3,ModemSigQual(),FP2)
+  FieldNames ("ModemRSSI:RSSI (2G+3G) of modem [dBm],ModemRSRP:4G-RSRP of modem [dBm],ModemRSRQ:4G-RSRQ of modem [dB]")
+  Average (1,BodyTempSnowSurf_act,FP2,SnowSurf_disableTableProcess)
+  FieldNames("SnowSurfBodyTemp: snow surface body temp [°C]")
+  Sample (1,latitude_a,FP2)
+  FieldNames ("latidue_a: GPS latitude degrees [deg]")
+  Sample (1,latitude_b,FP2)
+  FieldNames ("latidue_b: GPS latitude minutes [min]")
+  Sample (1,longitude_a,FP2)
+  FieldNames ("longitude_a: GPS longitude degrees [deg]")
+  Sample (1,longitude_b,FP2)
+  FieldNames ("longitude_b: GPS longitude minutes [min]")
+  Sample (1,magnetic_variation,FP2) 'Magnetic variation from true north (+ = East; - = West)
+  FieldNames ("magnetic_variation: GPS Magnetic variation (positive = East, negative =West")
+
+  Sample (1,fix_quality,FP2)        'GPS fix quality: 0 = invalid, 1 = GPS, 2 = differential GPS, 6 = estimated
+  FieldNames ("fix_quality: GPS Fix Quality (0 = invalid, 1 = GPS, 2 = differential GPS, 6 = estimated")
+  Sample (1,nmbr_satellites,FP2)    'Number of satellites used for fix
+  FieldNames ("nmbr_satellites: GPS Number of satellites")
+  Sample (1,altitude,FP2)          'Antenna altitude
+  FieldNames ("altitude: GPS altitude meter [m]")
+  Sample (1,pps,FP2)               'usec into sec of system clock when PPS rising edge occurs, typically 990,000 once synced
+  FieldNames ("pps: GPS Pusle per second (PPS) length [ms]")
+  Sample (1,dt_since_gprmc,FP2)    'Time since last GPRMC string, normally less than 1 second
+  FieldNames ("dt_since_gprmc: GPS Second since last GPRMC sentence [s]")
+  Sample (1,gps_ready,FP2)                  'Counts from 0 to 10, 10 = ready
+  FieldNames ("gps_ready: GPS ready, 10 = ready")
+  Sample (1,max_clock_change,FP2)  'Maximum value the clock was changed in msec
+  FieldNames ("max_clock_change: GPS maximum clock change [ms]")
+  Sample (1,nmbr_clock_change,FP2)
+  FieldNames ("nmbr_clock_change: clock change count")
+  
+  Minimum (3,SHM31_Answer(3),FP2,SHM31_DataInvalid,False) 'SHM31 temperatur values
+  FieldNames ("SHM31_TemperatureBlock:temperature device block [°C],SHM31_TemperatureWindow:temperature inside window [°C],SHM31_TemperatureLaser:temperature laser diode [°C]")
+  Minimum (1,SHM31_SignalQuality,UINT2,SHM31_DataInvalid,False)
+  FieldNames ("SHM31_SignalQuality:normalised signal of SHM31")
+  Maximum (1,SHM31_ErrorCode,UINT2,SHM31_DataInvalid,False)
+  FieldNames ("SHM31_ErrorCode:error code of SHM31")
+  Maximum (1,SHM31_Tilt,FP2,SHM31_DataInvalid,False)
+  FieldNames ("SHM31_Tilt:tilt of SHM31 [°]")
+EndTable
+
+DataTable (TableName_Status,StatusTableEnabled,TableSize_Status)
+    'this table contains several status information about the station
+  Sample (1,Logger,String)
+  FieldNames ("LoggerName:one from settings")
+  Sample (1,ProgramName,String)
+  FieldNames ("ProgramName:filename of program")
+  Sample (1,ProgStartTime,NSEC)
+  FieldNames ("ProgStartTime:time of program-start")
+  Sample (1,ProgramSignature,UINT2)
+  FieldNames ("ProgramSignature:signature of program")
+  Sample (1,ProgramErrors,UINT2)
+  FieldNames ("ProgramErrors:errors during compile or runtime")
+  Sample (1,CalibErrors,UINT2)
+  FieldNames ("CalibErrors:calibration errors")
+  Sample (1,BackupBattery,String)
+  FieldNames ("LithiumBattery:healtch check")
+  Sample (1,StatusActual,UINT2)      'binary coded status variable
+  FieldNames ("ActualStatus:actual status binary coded")
+  Sample (1,StatusDisabledSensors,UINT2)
+  FieldNames ("DisabledSensorsStatus:disabled sensors binary coded")
+EndTable
+
+'***   function & subroutines   ******************************************************
+Function GetStatus ()      'read some actual status data from Status-table
+  Logger = Status.StationName
+  ProgramName = Status.ProgName
+  ProgStartTime = Status.StartTime
+  ProgramSignature = Status.ProgSignature
+  ProgramErrors = Status.ProgErrors
+  CalibErrors = Status.ErrorCalib
+  BackupBattery = Status.LithiumBattery
+  If Status.CardStatus = "Card OK." Then       'test if a card is inserted / present
+    CardsFreeMemory = Status.CardBytesFree / toKiloB
+  EndIf          'read how much space is left on SD-card [kB]
+       'clear or set bit-wise according to the sensors status
+  StatusDisabledSensors = IIF (EnableTaRhMeasure = True,StatusDisabledSensors AND NOT TaRH1_off,StatusDisabledSensors OR TaRH1_off)
+  StatusDisabledSensors = IIF (EnableWindMeasure = True,StatusDisabledSensors AND NOT WindMeasure_off,StatusDisabledSensors OR WindMeasure_off)
+EndFunction
+'+++   measure air temperature and relative humidity   +++++++++++++++++++++++++++++++
+
+Function TempAirRelHumMeasuring (HygroVUE_Address)   'read the HygroVUE10s values and evaluate it
+  
+  If EnableTaRhMeasure = True AND TaRH_HygroVUE10 = True Then
+    SDI12Recorder (TaRHdataTemp(),HygroVUE10_SDIPort,HygroVUE_Address,HygroVUE10_ReadCMD,1,0)
+       'read values of HygroVUE10-sensor, if it's enabled and a HygroVUE10 is present
+    If HygroVUE10_enableRHrelIceCorr = True AND TempAir_act_Temp <= HygroVUE10_thresholdRHrelIceCorr Then
+      'below 0°C the air humidity is saturated relative to ice earlier than to water,
+      '  therefore if humidity relative to ice is needed, output has to be corrected
+      RelHum_act_Temp = RelHum_act_Temp / (HygroVUE10_RHrelIceCorr_multiplier * TempAir_act_Temp + HygroVUE10_RHrelIceCorr_offset)
+      If RelHum_act_Temp > 100 Then       'due to the correction the value can be slightly
+        RelHum_act_Temp = 100             '  above 100%, which doesn't make sense
+      EndIf
+    EndIf
+      'check for plausibility of the TaRH-values and set according values and status    
+    If TempAir_act_Temp = NaN OR RelHum_act_Temp = NaN Then
+      TempAir_act_Temp = SensorErrorValue 'if sensor values can't be read, set value as
+      RelHum_act_Temp = SensorErrorValue  '  a sensor error (6998)
+      If HygroVUE_Address = 1 Then
+        StatusActual = StatusActual OR TaRH1_error          'set bit-wise error-bit
+        TaRH1_disableTableProcess = True          'don't process actual values for table
+      ElseIf HygroVUE_Address = 2 Then
+        StatusActual = StatusActual OR TaRH2_error          'set bit-wise error-bit
+        TaRH2_disableTableProcess = True          'don't process actual values for table
+      ElseIf HygroVUE_Address = 3 Then
+        StatusActual = StatusActual OR TaRH3_error          'set bit-wise error-bit
+        TaRH3_disableTableProcess = True          'don't process actual values for table
+      EndIf
+    Else                             'if not NaNs, clear bit-wise off and error-bits
+      If HygroVUE_Address = 1 Then
+        StatusActual = StatusActual AND NOT(TaRH1_off OR TaRH1_error)
+        TaRH1_disableTableProcess = False         'process the values in the data table
+      ElseIf HygroVUE_Address = 2 Then
+        StatusActual = StatusActual AND NOT(TaRH2_off OR TaRH2_error)
+        TaRH2_disableTableProcess = False         'process the values in the data table
+      ElseIf HygroVUE_Address = 3 Then
+        StatusActual = StatusActual AND NOT(TaRH3_off OR TaRH3_error)
+        TaRH3_disableTableProcess = False         'process the values in the data table
+      EndIf
+    EndIf
+  Else 'else of "If EnableTaRhMeasure = True AND TaRH_HygroVUE10 = True Then"
+    TempAir_act_Temp = SensorOffValue     'if sensor is disabled or not present,
+    RelHum_act_Temp = SensorOffValue      '  set value as for sensor off (6999)
+    StatusActual = StatusActual OR TaRH1_off    'set bit-wise off-bit
+    StatusActual = StatusActual OR TaRH2_off    'set bit-wise off-bit
+    StatusActual = StatusActual OR TaRH3_off    'set bit-wise off-bit
+    TaRH1_disableTableProcess = False 'process the values in the data table
+    TaRH2_disableTableProcess = False 'process the values in the data table
+    TaRH3_disableTableProcess = False 'process the values in the data table
+  EndIf
+  
+  If HygroVUE_Address = 1 Then
+    TempAir_act1 = TempAir_act_Temp
+    RelHum_act1 = RelHum_act_Temp
+  ElseIf HygroVUE_Address = 2 Then
+    TempAir_act2 = TempAir_act_Temp
+    RelHum_act2 = RelHum_act_Temp
+  ElseIf HygroVUE_Address = 3 Then
+    TempAir_act3 = TempAir_act_Temp
+    RelHum_act3 = RelHum_act_Temp
+  EndIf
+  
+EndFunction      
+'+++   end function TempAirRelHumMeasuring   ++++++++++++++++++++++++
+
+'+++   measure snow surface temperature (Waljag SnowSurfSDI-sensor)   +++++++++
+
+Function SnowSurfTempMeasuring()
+  If EnableSnowSurfaceMeasure = True AND SnowSurfTemp_IRsensor = True Then
+    SDI12Recorder(SnowSurfSDI_data(),SnowSurf_SDIPort,SnowSurfSDI_Address,SnowSurfSDI_ReadCMD,1,0)
+    TempSnowSurf_act = TempSnowSurf_act + SnowSurfSDI_Offset
+    If TempSnowSurf_act < SnowSurfTemp_minVal OR TempSnowSurf_act > SnowSurfTemp_maxVal Then
+      TempSnowSurf_act = SensorErrorValue
+      SnowSurf_disableTableProcess = True
+    Else
+      SnowSurf_disableTableProcess = False  
+      StatusActual = StatusActual OR SnowSurf_off
+    EndIf
+    If BodyTempSnowSurf_act < SnowSurfTemp_minVal OR BodyTempSnowSurf_act > SnowSurfTemp_maxVal Then 
+      BodyTempSnowSurf_act = SensorErrorValue
+      SnowSurf_disableTableProcess = True
+    Else
+      SnowSurf_disableTableProcess = False  
+      StatusActual = StatusActual OR SnowSurf_off
+    EndIf
+  Else
+    BodyTempSnowSurf_act = SensorOffValue  
+    TempSnowSurf_act = SensorOffValue
+    SnowSurf_disableTableProcess = False
+    StatusActual = StatusActual OR SnowSurf_off
+  EndIf
+
+EndFunction   '+++   end function SnowSurfTempMeasurung   +++++++++
+
+'+++   check modems signal quality   +++++++++++++++++++++++++++++++++++++++++++++++++
+
+Function ModemCheckSigQual ()
+  'get signal strenght data from router
+  get_success = HTTPPost(URI_RUTModuleRouter,RUTModuleContent,responseString,RUTModuleHeader)
+  If get_success Then
+    SplitStr (cutString, responseString, "ubus_rpc_session"+QM+":",1,4)
+    SplitStr (RUTUbusRpcSession, cutString, ","+QM+"timeout",1,5)
+    HTTPPost(URI_RUTModuleRouter,"{"+QM+"jsonrpc"+QM+": "+QM+"2.0"+QM+", "+QM+"id"+QM+": 1, "+QM+"method"+QM+": "+QM+"call"+QM+", "+QM+"params"+QM+": ["+RUTUbusRpcSession+", "+QM+"file"+QM+", "+QM+"exec"+QM+",{"+QM+"command"+QM+":"+QM+"gsmctl"+QM+","+QM+"params"+QM+":["+QM+"-q"+QM+"]}]}",responseString,RUTModuleHeader)
+    SplitStr (cutString, responseString, "RSSI:",1,4)
+    SplitStr (ModemRSSI, cutString, "RSSI:",1,0)
+    SplitStr (cutString, responseString, "RSRP:",1,4)
+    SplitStr (ModemRSRP, cutString, "RSRP:",1,0)
+    SplitStr (cutString, responseString, "RSRQ:",1,4)
+    SplitStr (ModemRSRQ, cutString, "RSRQ:",1,0)    
+    HTTPPost(URI_RUTModuleRouter,"{"+QM+"jsonrpc"+QM+": "+QM+"2.0"+QM+", "+QM+"id"+QM+": 1, "+QM+"method"+QM+": "+QM+"call"+QM+", "+QM+"params"+QM+": ["+RUTUbusRpcSession+", "+QM+"file"+QM+", "+QM+"exec"+QM+",{"+QM+"command"+QM+":"+QM+"gsmctl"+QM+","+QM+"params"+QM+":["+QM+"-F"+QM+"]}]}",responseString,RUTModuleHeader)
+    SplitStr (cutString, responseString, "stdout"+QM+":"+QM,1,4)
+    SplitStr (ModemNetTech, cutString, "|",1,5)
+  EndIf
+EndFunction      '+++   end function ModemCheckSigQual   +++++++++++++++++++++++++++++
+
+'+++   check heat cond. for SN500SS   +++++++++++++++++++++++++++++++++++++++++++++++++
+Function SN500SS_HeatCondition As Boolean      'check if the conditions are given to
+  Dim RadiationToLow, WeatherConditions As Boolean  '  heat the SN500SS-radiomenter
+  If TimeIsBetween (SN500SS_RadMinTimewindowStart,SN500SS_RadMinTimewindowStop,SN500SS_RadMinTimewindowInt,min) AND ISWRmax < SN500SS_HeatRadMinThreshold Then
+    RadiationToLow = True            'check if the incomming short wave radiation is
+  Else                               '  to low, as it should be during daytime
+    RadiationToLow = False
+  EndIf
+  If TempAir_act1 < SN500SS_HeatTempThreshold AND RelHum_act1 >= SN500SS_HeatHumThreshold Then
+    WeatherConditions = True         'check if the weather conditions would possible
+  Else                               '  a freezing of the sensor
+    WeatherConditions = False
+  EndIf
+  Return RadiationToLow OR WeatherConditions   'if one of these criterions are true
+EndFunction      '+++   end function SN500SS_HeatCondition   +++++++++++++++++++++++++++++
+
+'+++   check if modem needs to turn on   +++++++++++++++++++++++++++++++++++++++++++++++++
+Function ModemCheckTurnOn As Boolean 
+   Dim ModemTurnOn As Boolean 
+   ' intialize modemTurnOn variable
+   ModemTurnOn = False
+   
+   ' check modem turn on on time intervall modem and check battery threshold of modem 
+   If TimeIsBetween(ModemStartTime,ModemEndTime,ModemInterval,min) Then
+     If BatteryVoltage_min > Modem_BattThreshold Then
+       ModemTurnOn = True
+     EndIf
+   EndIf
+   
+   ' check modem turn on on Manuel Flag Modem and check battery threshold of modem 
+   If ModemPwrManual = True Then
+     If BatteryVoltage_min > Modem_BattThreshold Then
+       ModemTurnOn = True
+     EndIf
+   EndIf
+   
+   ' check modem turn on on time intervall Laser & Laser not disabled and check battery threshold of modem and laser
+   If TimeIsBetween(LaserPowerStartTime,LaserPowerEndTime,LaserPowerInterval,min) Then
+     If DisableLaser = False Then
+       If BatteryVoltage_min > Modem_BattThreshold Then
+         If BatteryVoltage_min > Laserscanner_BattTreshold Then
+           ModemTurnOn = True
+         EndIf
+       EndIf
+     EndIf
+   EndIf
+   
+   ' check modem turn on on Manual Flag Laser PC and check battery threshold of modem and laser
+   If LaserPcPwrManual = True Then
+     If BatteryVoltage_min > Modem_BattThreshold Then
+       If BatteryVoltage_min > Laserscanner_BattTreshold Then
+         ModemTurnOn = True
+       EndIf
+     EndIf
+   EndIf
+
+   Return ModemTurnOn
+EndFunction       '+++   end function check if modem needs to turn on   ++++++++++++++++++
+
+'---   initialize loggers interfaces   -----------------------------------------------
+
+SDMBeginPort (IRGASON_SDMport)       'configure SDM port on U9, U10 & U11
+
+'Main Program
+BeginProg
+StatusActual = 0                   'reset status variable
+ForceMeasurements = True             'flag to force measurements
+EnableWindMeasure = True              'enable wind measurement
+EnableTaRhMeasure = True              'enable tempAir & relHum
+EnableSnowSurfaceMeasure = True       'enable snow surface measurm.
+MeteoTableEnabled = True     'flags to disable the storing of
+ServiceTableEnabled = True   '  any records in a table
+StatusTableEnabled = True
+TaRH1_disableTableProcess = False                   'flags to disable the processing
+TaRH2_disableTableProcess = False                 'flags to disable the processing
+TaRH3_disableTableProcess = False                 'flags to disable the processing
+SnowSurf_disableTableProcess = False               ' (averaging etc.) of certain samples 
+Irga_disableTableProcess = False
+' power flag set
+SensorPowerEnable = True                'enable all sensors
+DisableSN500SS = False
+ModemPwrManual = True
+LaserPwrManual = False
+LaserPcPwrManual = False
+DisableSpc = False
+SHM31_DoCalibration = False
+SHM31_ChangeParam = True
+  
+'disable laser after reset
+DisableLaser = True
+
+PortSet(LaserPowerDownPort,0)  'reset port
+
+'power port init
+SW12(SensorsPwrPort,NO_ON)
+SW12(ModemPwrPort,NO_OFF) 
+PortSet(SN500SS_PwrPort,NO_ON)
+PortSet(IRGASON_PwrPort,NO_ON)
+PortSet(LaserPwrPort,NO_OFF)
+PortSet(LaserPcPwrPort,NO_OFF)
+PortSet(SpcPwrPort,NO_ON)
+
+IPNetPower (1,True)  
+RealTime (LoggersTime)             'read here actual loggers time, otherwise startTime is wrong
+SerialOpen(GPSPort,38400,3,0,1001)
+GetStatus()
+CallTable TableName_Status         'store the startup-status
+  
+'--- initialize instruments ------------------------------------------------------
+SDI12Recorder (SHM31_SpecialCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_ResetHeatCtrlCMD,1,0)
+SDI12Recorder (SHM31_SpecialCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_DefrostStartCMD,1,0)
+SDI12Recorder (SHM31_MeasIntervalCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_MeasIntervalCMD,1,0)
+SDI12Recorder (SHM31_LaserMeasIntervalCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_LaserMeasIntervalCMD,1,0)
+'send command to enable to automatic heat control 
+'Timer (Timer_SHM31_Heater,min,Stop_Reset) 'initialize timer for heater dead time
+
+
+'---   fast scan loop   --------------------------------------------------------------
+	Scan (FastScanIntervall,msec,0,0)
+		If EnableWindMeasure = True Then
+		  EC100 (Irga_Ux,IRGASON_SDMaddr,IRGASON_normalOutCMD)
+        'read the data from IRGASON EC100, over SDM-connection
+      CallTable IrgaWindFast
+    EndIf
+	NextScan
+'---   MAIN scan loop   --------------------------------------------------------------
+  SlowSequence (1)
+    Scan (MainScanInterval,sec,0,0)
+      PanelTemp (LoggerTemp,_50Hz)
+		  Battery (BatteryVoltage)
+      MinRun (BatteryVoltage_min,1,BatteryVoltage,BattMin_RunNr)
+      'calculate running minimum of voltage during BattMin_Time, for modem power off
+      '+++   measure the other meteo-sensors   ++++++++++++++++++++++++++++++++++++++
+      If TimeIntoInterval (0,MeasureMeteoInterval,sec) OR ForceMeasurements = True Then
+        TempAirRelHumMeasuring ("1")      'read the HygroVUE10s values and evaluate it
+        TempAirRelHumMeasuring ("2")      'read the HygroVUE10s values and evaluate it
+        TempAirRelHumMeasuring ("3")      'read the HygroVUE10s values and evaluate it
+        SnowSurfTempMeasuring()        'read the Waljag-SnowSurf values and evaluate it
+        SDI12Recorder (SnowDrift_FC4(),FlowCaptSDIPort,FlowCapt_Address,FlowCapt_ReadCMD,1,0)
+        SDI12Recorder (RadNet_SN500SS(),SN500SS_SDIPort,SN500SS_Address,SN500SS_ReadCMD,1,0)
+        SDI12Recorder (ClimaVueData(),ClimaTRH_SDIPort,ClimaVueAddress,ClimaVue_StdReadCMD,1,0,-1)
+          'read CimaVUE50s measurement values (all 14 values)
+      EndIf
+
+      '+++   Measuring SHM31   ++++++++++++++++++++++++++++++++
+      If SHM31_DoCalibration = False Then 
+        SDI12Recorder (SHM31_Answer(SHM31_Buffer0_Index),SHM31_SDIPort,SHM31_SDIAddress,SHM31_ReadCMD_0,1,0)
+        SDI12Recorder (SHM31_Answer(SHM31_Buffer1_Index),SHM31_SDIPort,SHM31_SDIAddress,SHM31_ReadCMD_1,1,0)    
+        'read both data buffers (commands R0! & R1!), with M! there's no data
+        SHM31_SnowHeight = SHM31_SnowHeight * 1000 'convert from m to mm
+        SHM31_DataInvalid = IIF (SHM31_Timestamp <= SHM31_StartupDelay,True,False) 'after SHM31 startup, data should be valid to be processed in
+      EndIf 
+
+      CallTable TableName_Meteo
+      CallTable TableName_Service
+      
+      '-------------------------------------------------------------------------
+      '---   Power control secion           ------------------------------------
+      '-------------------------------------------------------------------------
+
+      '---    check main power enable           ----------------------------
+      If BatteryVoltage_min < BattThresholdCritical OR SensorPowerEnable = False Then
+      'inform PC before shutdown 
+        If waitForOneMainScanIntervalOver = True Then
+          '--- do powerdown
+          SW12(SensorsPwrPort,NO_OFF)
+          SW12(ModemPwrPort,NO_OFF) 
+          PortSet(SN500SS_PwrPort,NO_OFF)
+          PortSet(IRGASON_PwrPort,NO_OFF)
+          PortSet(SpcPwrPort,NO_OFF)
+          '--- update status
+          StatusActual = StatusActual OR SensorPwr_off
+          StatusActual = StatusActual OR Spc_off
+          StatusActual = StatusActual OR WindMeasure_off
+          StatusActual = StatusActual OR SN500SS_off
+          StatusActual = StatusActual OR TaRH1_off
+          StatusActual = StatusActual OR TaRH2_off
+          StatusActual = StatusActual OR TaRH3_off
+          StatusActual = StatusActual OR SnowSurf_off
+          StatusActual = StatusActual OR Laser_off          
+        Else
+          waitForOneMainScanIntervalOver = True
+          PortSet(LaserPowerDownPort,1)  'inform pc before powerdown
+        EndIf 
+      Else
+        '--- enable main power, if battery over threshold and sensor power enabled
+        SW12(SensorsPwrPort,NO_ON)
+        StatusActual = StatusActual AND NOT SensorPwr_off        
+        StatusActual = StatusActual AND NOT TaRH1_off
+        StatusActual = StatusActual AND NOT TaRH2_off
+        StatusActual = StatusActual AND NOT TaRH3_off
+        StatusActual = StatusActual AND NOT SnowSurf_off
+        
+        '--- IRGASON power control
+        If BatteryVoltage_min < Irgason_BattThreshold OR EnableWindMeasure = False Then
+          PortSet(IRGASON_PwrPort,NO_OFF)
+          StatusActual = StatusActual OR WindMeasure_off
+        Else 
+          PortSet(IRGASON_PwrPort,NO_ON)
+          StatusActual = StatusActual AND NOT WindMeasure_off
+        EndIf
+        '--- SN500SS power control
+        If BatteryVoltage_min < SN500SS_HeatBattThreshold OR DisableSN500SS = True Then
+          PortSet(SN500SS_PwrPort,NO_OFF)
+          StatusActual = StatusActual OR SN500SS_off
+        Else
+          PortSet(SN500SS_PwrPort,NO_ON)
+          StatusActual = StatusActual AND NOT SN500SS_off
+        EndIf
+        '--- SPC power control
+        If BatteryVoltage_min < Spc_BattThreshold OR DisableSpc = True Then
+          PortSet(SpcPwrPort,NO_OFF)
+          StatusActual = StatusActual OR Spc_off
+        Else
+          PortSet(SpcPwrPort,NO_ON)
+          StatusActual = StatusActual AND NOT Spc_off
+        EndIf
+        
+        '---   Modem Power   -----------------------------------------------------
+        '---   The following sensors run only if also the modem runs.
+        '---   These are
+        '---     - the Laser
+        '---     - the Laser PC
+        '-------------------------------------------------------------------------
+  
+        '---   Modem Power and Check signal quality   ----------------------------
+        If ModemCheckTurnOn() = True Then
+          IPNetPower (ModemPwrOption,True)
+          SW12(ModemPwrPort,True) 
+          ' Check after Startup and amount of time Modem signal quality
+          If TimeIsBetween(ModemCheckSigStartTime,ModemCheckSigEndTime,ModemCheckSigInterval,min) Then
+            ModemCheckSigQual ()
+          EndIf
+
+          '--- check if also Laser or Laser Pc need to be turned on
+          '---   Power Laser PC  -------------------------------------------------------
+          ReadIO(LaserScanNotFinished, LaserScanNotFinishedMask, UniversalTerminal)
+          If LaserPcPwrManual OR (TimeIsBetween(LaserPowerStartTime,LaserPowerEndTime,LaserPowerInterval,min) AND NOT DisableLaser AND LaserScanNotFinished ) Then
+            If BatteryVoltage_min > Laserscanner_BattTreshold Then
+              waitForOneMainScanIntervalOver = False
+              PortSet(LaserPowerDownPort,0)  'reset port
+              PortSet(LaserPcPwrPort,NO_ON)  'turn Laser Pc on
+              '---   Power Laser  -------------------------------------------------------
+              If LaserPwrManual OR (TimeIsBetween(LaserPowerStartTime,LaserPowerEndTime,LaserPowerInterval,min) AND NOT DisableLaser AND LaserScanNotFinished) Then
+                PortSet(LaserPwrPort,NO_ON)
+                StatusActual = StatusActual AND NOT Laser_off
+              Else
+                '--- turn off Laser
+                PortSet(LaserPwrPort,NO_OFF)
+                StatusActual = StatusActual OR Laser_off
+              EndIf
+            Else
+             'inform PC before shutdown
+              If waitForOneMainScanIntervalOver = True Then
+                 '--- turn off LaserPC and Laser
+                 PortSet(LaserPwrPort,NO_OFF)
+                 PortSet(LaserPcPwrPort,NO_OFF)
+                 StatusActual = StatusActual OR Laser_off
+               Else
+                 waitForOneMainScanIntervalOver = True
+                 PortSet(LaserPowerDownPort,1)  'inform pc before powerdown
+              EndIf 
+            EndIf
+          Else
+            'inform PC before shutdown
+            If waitForOneMainScanIntervalOver = True Then
+               '--- turn off LaserPC and Laser
+               PortSet(LaserPcPwrPort,NO_OFF)
+               PortSet(LaserPwrPort,NO_OFF)
+               StatusActual = StatusActual OR Laser_off
+             Else
+               waitForOneMainScanIntervalOver = True
+               PortSet(LaserPowerDownPort,1)  'inform pc before powerdown
+            EndIf             
+          EndIf
+        Else
+          ' Laser and Laser PC off
+          'inform PC before shutdown
+          If waitForOneMainScanIntervalOver = True Then
+             ' modem off
+             SW12(ModemPwrPort,False)      
+             IPNetPower (ModemPwrOption,False)
+             '--- turn of pc and laser
+             PortSet(LaserPcPwrPort,NO_OFF)
+             PortSet(LaserPwrPort,NO_OFF)
+             StatusActual = StatusActual OR Laser_off   
+           Else
+             waitForOneMainScanIntervalOver = True
+             PortSet(LaserPowerDownPort,1)  'inform pc before powerdown
+          EndIf 
+        EndIf    
+      EndIf
+    NextScan
+'---   slow scan loop   --------------------------------------------------------------
+  SlowSequence (2)
+    Scan (SlowScanInterval,min,0,0)
+      If TimeIntoInterval (0,ResetForceMeasurement,min) Then
+        ForceMeasurements = False    'if flag was set at beginning or manually,
+      EndIf                          '  reset it after the given time
+      
+      '+++        get and store gps data           +++++++++++++++++++++++++++++++++++++
+      '*** Measure the GPS using the Serial instruction
+      '--- rd=12V, wh(RX RJ45-Pin2)=RS-232, bl(TX RJ45-Pin1)=RS-232, bk/ye/gr/shield=GND
+      GPS (latitude_a,-COMRS232,LOCAL_TIME_OFFSET*3600,100,nmea_sentence(1))
+      '---   heating control for radiation sensor SN500SS   ----------------------------
+      If SN500SS_HeatCondition() = True AND BatteryVoltage_min >= SN500SS_HeatBattThreshold Then
+        SN500SS_Heater_TimerValue = Timer (Timer_SN500SS_Heater,min,Read_only)
+        If SN500SS_Heater_TimerValue = 0 Then  'start heating sequence, over SDI12
+          SDI12Recorder (SN500SSSpecialCMDresponse,SN500SS_SDIPort,SN500SS_Address,SN500SS_HeatOnCMD,1,0)
+          SN500SS_HeaterActive = True
+          Timer (Timer_SN500SS_Heater,min,T_Start)
+        ElseIf SN500SS_Heater_TimerValue >= SN500SS_HeatTime AND SN500SS_HeaterActive = True Then
+          SDI12Recorder (SN500SSSpecialCMDresponse,SN500SS_SDIPort,SN500SS_Address,SN500SS_HeatOffCMD,1,0)
+          SN500SS_HeaterActive = False         'stop heating, after defined heat time
+        ElseIf SN500SS_Heater_TimerValue >= SN500SS_HeatDeadTime Then
+          Timer (Timer_SN500SS_Heater,min,Stop_Reset)    'release for next sequence
+        EndIf
+      ElseIf SN500SS_HeaterActive = True Then  'still heating, although not necessary
+        SDI12Recorder (SN500SSSpecialCMDresponse,SN500SS_SDIPort,SN500SS_Address,SN500SS_HeatOffCMD,1,0)
+        SN500SS_HeaterActive = False           'stop heating sequence immediately
+      EndIf
+      If Timer (Timer_SN500SS_Heater,min,Read_only) >= SN500SS_HeatDeadTime Then
+        Timer (Timer_SN500SS_Heater,min,Stop_Reset)      'in case the sensor works well
+      EndIf                '  before the dead time ended or if the battery was to low
+      
+      ' ---- SHM31 start defrost cycle --------------------------------------------         
+      If ((SHM31_DoCalibration = False) AND (BatteryVoltage_min >= SHM31_DefrostBattThreshold)) Then
+        If ((SHM31_ErrorCode = SHM31_ViewBlockedError) OR (SHM31_ErrorCode = SHM31_TempLaserLow) OR (SHM31_TempLaser < 5) OR (SHM31_TempBlock < 5)) Then
+          SDI12Recorder (SHM31_SpecialCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_DefrostStartCMD,1,0)
+          SHM31_Defrost_count = SHM31_Defrost_count + 1
+        EndIf
+      EndIf
+
+      ' ---- SHM31 write parameter measure intervall --------------------------------------------         
+      If SHM31_ChangeParam = True Then
+        SDI12Recorder (SHM31_MeasIntervalCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_MeasIntervalChangeCMD,1,0)
+        SDI12Recorder (SHM31_LaserMeasIntervalCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_LaserMeasIntervalChangeCMD,1,0)
+        SHM31_ChangeParam = False
+      EndIf
+      
+      ' ---- SHM31 calibrate snowheight --------------------------------------------         
+      If SHM31_DoCalibration = True Then 'manual calib. of snow heigt measurement
+        If SHM31_SpecialCMDresp <> SHM31_CalibRESP Then
+          'if command was not send successfully yet, send it
+          SDI12Recorder (SHM31_SpecialCMDresp,SHM31_SDIPort,SHM31_SDIAddress,SHM31_CalibCMD,1,0)
+          'ElseIf SHM31_Timestamp > SHM31_StartupDelay AND Round (SnowHeight_Laser,1) = 0.0 Then
+          'had sensor time enough for good values and calibration was successful
+          SHM31_DoCalibration = False
+          SHM31_MeasIntervalCMDresp = ""
+          SHM31_LaserMeasIntervalCMDresp = ""
+        Else 'as this will be entered only next scan, there's time enough
+          SHM31_SpecialCMDresp = "" 'erease received response
+          SHM31_DoCalibration = False 
+        EndIf
+      EndIf
+
+      '+++   get and store the loggers status   +++++++++++++++++++++++++++++++++++++
+      If TimeIntoInterval (StatusTimeOnInt1,StatusRecordInterval,mon) OR TimeIntoInterval (StatusTimeOnInt2,StatusRecordInterval,mon) Then
+        GetStatus ()       'record status twice a month on first & on 15th day at noon
+        CallTable TableName_Status   'store status data to table
+      EndIf
+      CallTable TableName_Service
+    NextScan
+  EndSequence
+EndProg
+
