@@ -1,0 +1,721 @@
+' ---------------------------------------------------------
+' CR6 Series
+' Program: Antarctic Station 1 BASE (CR6 S/N: 1154)
+' Authors: Sergi Gonzalez, SLF
+' Modification of the program PEA_station_2023.CR6 of Hendrik Huwald, Nander Wever, Armin Sigmund, EPFL (27.09.2022)
+' Included from the last version: Change LICOR SDI adress, Delete SI-111 (now at CR6_B), Change Wind1 PPT
+' Date: 29.01.2025
+'
+' Program measures:
+'  1x CSAT3 3D sonic anemometer at 10Hz
+'  1x LI7500 Licor open path gas analyzer at 10Hz
+'  1x HygroVUE10 Temperature/Relative Humidity
+'  1x IS-111 IR Surface Temperature
+'  1x SR50A Snow depth (i.e. distance to surface)
+'  2x 05103-45 Young wind monitor
+'  1x GPS16X-HVS Garmin GPS
+'  2x SN500SS Apogee Net radiometer
+'  1x CS320 Apogee Pyranometer
+'  1x FlowCapt FC4 (particle flux and wind speed)
+'  Power management for SPC-95 Snow Particle Counter
+'  Power management for LI-7500 Licor Gas Analyzer
+
+'   100mA at 12V =  1.200W  CSAT3 continuous
+'   833mA at 12V = 10.000W  LI7500 (30W during warm-up)
+'   0.6mA at 12V =  0.008W  HygroVUE10 during 0.5s for measurement (quiescent: 50uA)
+'     0mA at 12V =  0.000W  SI-111
+'   250mA at 12V =  0.050W  SR50A for 1s during measurement = 3W/60 (quiescent: 1mA)
+' 2x switched excitation voltage supplied by data logger for Young Wind
+'    65mA at 12V =  0.780W  GPS Receiver
+'    50mA at 12V =  0.600W  CR6 estimated; 67mA @20Hz, 3mA @1Hz scan
+' 2x 63mA at 12V =  1.512W  SN500SS net radiometers including heater (without heater: negligible)
+'    25mA at 12V =  0.300W  CS320 including heater
+'    20mA at 12V =  0.240W  FlowCapt FC4 during 6s for measurement, (quiescent: 1mA)
+
+' SDI12 adresses:
+' 0: HygroVUE10
+' 1: SR50A
+' 2: CS320
+' 3: FC4 FlowCapt
+' 4: SN500SS upper
+' 5: SN500SS lower
+
+' To change this address, connect to logger using LoggerNet
+' Make sure only *one* SDI12 interface is connected to the same logger port
+' Choose Datalogger -> Terminal Emulator
+' Choose "Open terminal" and hit enter multiple times, until "CR6>" appears
+' Type "SDI12" and select the port (for this program, e.g. select U9, i.e.#7)
+' Verify address by typing: !?
+' Change address by typing: XAY!, where X = old address and Y = new address
+' Verify address again by typing !? to see if change was successful.
+' ---------------------------------------------------------
+
+'SequentialMode
+PipeLineMode
+
+' DECLARATIONS=============================================
+
+' Sampling, output and time stamp--------------------------
+
+' Scan frequencies 
+Const SFREQ1 = 100    ' [mSec] Main scan interval, (100mSec = 10Hz)
+Const SFREQ2 = 60     ' [Sec]  Slow sequence (1min)
+
+' Output frequencies
+Const OFREQ1 = 100    ' [mSec] fast output (CSAT3, LI7500, 100mSec = 10Hz)
+Const OFREQ2 = 60     ' [Sec]  slow output (Meteo/Stat data, 1min)
+
+' Declare local time offset relative to UTC time for GPS
+Const LOCAL_TIME_OFFSET = 0    ' Local time offset relative to UTC time
+
+' Power management-----------------------------------------
+
+' Power indicators (0: OFF or 1: ON)
+Public PowerSPC, PowerLIC, PowerHtr
+
+' Working variable used in the state machine
+Public SPC_State As Long
+
+' SPC: Periods of power on/off before changing the power state
+Const OffTimeSPC_lowVolt      = 60*12    ' 12 hours (in minutes)
+Const SPCrestart              = 7*24*60  '(in mins) forced restart to generate new data file
+Const OffTimeSPC_NewFile      = 5        '(in mins) power down before turning on after forced restart
+'Const SPCtimeBefore_WindCheck = 60       '(in mins) For this duration, SPC state needs to stay unchanged before potential change due to wind velocity criterion.
+'Const SPCtime_WindCheck       = 5        '(in mins) For this duration, wind velocity needs to stay below (above) threshold before turning SPC off (on)
+
+' LI7500: Period of power off before potentially power on again
+Const OffTimeLIC = 60*12      ' 12 hours (in minutes)
+' Net radiometers and CS320 pyranometer: Period of power off before potentially power on again
+Const OffTimeHtr = 60*12      ' 12 hours (in minutes)
+' Power cut-off values (battery voltage)
+Const LowVoltSPC = 12.0        ' Low power threshold for SPC-95, (PowerSPC, SW1)
+Const LowVoltLIC = 12.0        ' Low power threshold for LI7500, (PowerLIC, SW2)
+Const LowVoltHtr = 12.0        ' Low power threshold for heaters of net radiometers and CS320 pyranometer
+
+'Const LowVoltGeneral = 11.5    ' Low power theshold for GPS and SDI-12 measurements
+'Const VoltTurnOn_General = 12.8 ' Threshold for turning GPS and SDI-12 measurements on after stopping them and the writing to OneMin files due to low voltage
+Const DeltaVolt  =  0.2        ' For switching power on again after voltage was low, voltage needs to stay above LowVolt* + DeltaVolt for a certain duration
+'Const SPC_WindThresh = 4        ' [m/s] Wind speed above which SPC is turn on (if battery ok) or below which it is turned off
+
+' Table Management-----------------------------------------
+
+Const FileDuration    = 24*60 '[min] for calculating number of records per file. Should be smaller than approx. 28*24*60 to not exceed the maximum file size of 2 GB
+Const MaxLines_fast   = FileDuration * 60 / (OFREQ1/1000) ' number of records in each fast file
+Const MaxLines_OneMin = FileDuration * 60 / OFREQ2
+Const MaxLines_wind   = FileDuration * 60 / OFREQ2
+Public LastWrittenFile_fast As String * 32 ' stores the filename of the last file written to the card
+Public LastWrittenFile_OneMin As String * 32
+Public LastWrittenFile_wind As String * 32
+
+'Public clockdrift
+Public LoggerTime(9) As Long
+Alias LoggerTime(1) = year
+Alias LoggerTime(2) = month
+Alias LoggerTime(3) = dom
+Alias LoggerTime(4) = hour
+Alias LoggerTime(5) = minute
+Alias LoggerTime(6) = second
+Alias LoggerTime(9) = doy
+
+' CSAT3----------------------------------------------------
+
+' CSAT3 address
+Const CSAT3_address = 3	'S/N:1255 (Station 1) BASE
+'Const CSAT3_address = 8 'S/N:1001 (Station 2) PLAT
+
+' CSAT3 execution parameter
+Const CSAT_OPT = INT(1000/SFREQ1)  'Denominator in mSec
+' Default SDM clock speed
+Const SDM_PER = 30
+
+Public wind(5)
+
+Alias wind(1) = Ux
+Alias wind(2) = Uy
+Alias wind(3) = Uz
+Alias wind(4) = Ts
+Alias wind(5) = diag_csat
+Units wind = m/s
+Units Ts = degC
+Units diag_csat = none
+
+' CSAT3 warning flags:
+' 1) delta temperature, 2) poor signal lock,
+' 3) amplitude high, or 4) amplitude low.
+'Public diag_bits(4) As Boolean
+'Units diag_bits = samples
+
+'Alias diag_bits(1) = delT_f
+'Alias diag_bits(2) = sigl_f
+'Alias diag_bits(3) = amph_f
+'Alias diag_bits(4) = ampl_f
+
+' Diagnostic variables
+Dim disable_flag_on(2) As Boolean
+Dim n
+Units n = samples
+
+' Working variables
+Dim diag_csat_work As Long
+
+' LI7500---------------------------------------------------
+
+'Const LIC75_address = 14  'Licor #4, SDM: 14 (Station 1) BASE
+Const LIC75_address = 12  'Licor #2, SDM: 12 (Station 2) PLAT
+
+Public LIC75(4) As Float  'Licor output mode set equal to 6 !!!
+
+Alias LIC75(1) = LI_CO2m  'CO2 [mmol/m3]
+Alias LIC75(2) = LI_H2Om  'H2O [mmol/m3]
+Alias LIC75(3) = LI_Pres  'Pressure [kPa]
+Alias LIC75(4) = LI_diag  'Diagnostic value
+
+Units LI_CO2m = mmol/m3
+Units LI_H2Om = mmol/m3
+Units LI_Pres = kPa-80    'Subtraction to keep good precision for data format FP2 (80kPa is close to average pressure at PEA)
+Units LI_diag = none
+
+' Other variables------------------------------------------
+
+' SI-111 constants (FROM CALIBRATION SHEET!)
+
+' S/N:5661 (Station 1):
+'Const mC2 = 77121.6
+'Const mC1 = 7333840
+'Const mC0 = 1262700000
+'Const bC2 = 3459.13
+'Const bC1 = 169383
+'Const bC0 = -7469000
+
+' S/N:5663 (Station 2):
+'Const mC2 = 78619.4
+'Const mC1 = 7571700
+'Const mC0 = 1303070000
+'Const bC2 = 2527.03
+'Const bC1 = 226048
+'Const bC0 = -5975200
+
+' GPS
+Const GPSPort = ComU1
+Public RMCstring As String * 500
+'rmc variables
+'Public rmcid As String
+Public rmcutctime As String * 8 ' HHMMSS
+Public rmcstatus As String * 4  ' "A" (valid) or "V" (invalid)
+Public rmclatitude As String * 12 ' not more than 12 characters needed in output (length is defined as multiple of 4)
+'Public rmcin_s_ind As String
+Public rmclongitude As String * 12
+'Public rmce_w_indicator As String
+'Public rmcspeed As String
+'Public rmccourse As String
+Public rmcutcdate As String * 8 ' YYMMDD
+'Public rmcmagvariation As String
+'Public rmcmage_w As String
+'Public rmcchecksum As String
+Dim NBytesReturned As Long
+Dim SubStrings(16) As String * 32, rawdata As String * 500
+Dim CalculatedChecksum As Long, ReportedChecksum As Long
+
+' Battery voltage
+Public BattV
+Units BattV = Volts
+
+' Sensors
+Public PTemp            'CR6
+Public TRHData(2)		    'HygroVUE10
+Alias TRHData(1) = TA   'HygroVUE10
+Alias TRHData(2) = RH		'HygroVUE10
+Public HSData(2)		    'SR50A
+Alias HSData(1)=HS_Raw	'SR50A
+Alias HSData(2)=HS_Qty	'SR50A
+Public HS_Cor 			    'SR50A
+Public WS1			        'YOUNG1
+Public WD1			        'YOUNG1
+Public WS2			        'YOUNG2
+Public WD2			        'YOUNG2
+Public m,b 			        'SI-111
+Public TargmV			      'SI-111
+Public SFTempK		      'SI-111
+Public SBTempC			    'SI-111
+Public SBTempK			    'SI-111
+Units PTemp = degC	    'CR6
+Units TA = degC		      'HygroVUE10
+Units RH = %		        'HygroVUE10
+Units HS_Cor = m		    'SR50A
+Units WS1 = m/s			    'YOUNG1
+Units WD1 = deg			    'YOUNG1
+Units WS2 = m/s			    'YOUNG2
+Units WD2 = deg			    'YOUNG2
+
+Public NetRad1(4)       'upper Apogee net radiometer
+'Rename Variables
+Alias NetRad1(1) = SWdown1
+Alias NetRad1(2) = SWup1
+Alias NetRad1(3) = LWdown1
+Alias NetRad1(4) = LWup1
+Units NetRad1 = W/m2
+Dim Heater_NetRad1
+
+Public NetRad2(4)       'lower Apogee net radiometer
+'Rename Variables
+Alias NetRad2(1) = SWdown2
+Alias NetRad2(2) = SWup2
+Alias NetRad2(3) = LWdown2
+Alias NetRad2(4) = LWup2
+Units NetRad2 = W/m2
+Dim Heater_NetRad2
+
+Public CS320(6)         'ApogeePyranometer
+Alias CS320(1) = SWdn
+Alias CS320(2) = SWdn_mV
+Alias CS320(3) = SensorT
+Alias CS320(4) = X_orient
+Alias CS320(5) = Y_orient
+Alias CS320(6) = Z_orient
+Units SWdn = W/m2
+Units SWdn_mV = mV
+Units SensorT = degC
+Units X_orient = deg
+Units Y_orient = deg
+Units Z_orient = deg
+Dim Heater
+
+' FlowCapt FC4
+' Aquisition duration: 6sec, cycle duration (aquisition + stand-by): 60s, measurement (averaging) duration: 60s
+' Measure all 8 default quantities but only output (average) particle flux and (average) wind speed
+Public FC4(8)
+'Alias FC4(1) = PF_min
+Alias FC4(2) = PF_FC4 '(average) particle flux
+'Alias FC4(3) = PF_max
+'Alias FC4(4) = PF_std
+'Alias FC4(5) = PF_sum
+'Alias FC4(6) = WS_min
+Alias FC4(7) = WS_FC4 '(average) wind speed
+'Alias FC4(8) = WS_max
+'Units WS_min = km/h
+'Units WS_max = km/h
+Units WS_FC4 = km/h
+'Units PF_min = g/m2/s
+'Units PF_max = g/m2/s
+Units PF_FC4 = g/m2/s
+'Units PF_sum = g/m2
+'Units PF_std = g/m2/s
+
+' Define Data Tables---------------------------------------
+
+DataTable(STN1fast,True,-1) 'auto-allocates the memory available after creating the fixed-sized tables
+  DataInterval(0,OFREQ1,mSec,0) 'not needed if we limit the file size by the number of records and not by a time interval
+  TableFile("CRD:STN1fast_",64,-2,MaxLines_fast,0,Min,0,LastWrittenFile_fast) 'creates a new file after MaxLines_fast records, 
+                                ' no limit for the maximum number of files but no new files anymore if card storage is full, 
+                                ' the file is only accessed once to write all records.
+  Sample(4,Ux,IEEE4)        ' Ux, Uy, Uz, Ts
+  Sample(1,diag_csat,UINT2) ' CSAT3 diagnostic word. Store as two-byte unsigned integer.
+  Sample(2,LI_H2Om,FP2)     ' H2O and air pressure. FP2 precision is enough because H2O noise is 0.18 and 0.26 mmol/m^3 at 10 and 20 Hz, respectively.
+  Sample(1,LI_diag,UINT2)   ' LI7500 diagnostic value. Store as two-byte unsigned integer.
+EndTable
+
+DataTable(STN1wind,True,MaxLines_wind) 'allocates the memory needed for MaxLines_wind records
+  DataInterval(0,OFREQ2,Sec,0) 'needed to get one record per minute although CallTable() is in the fast scan
+  TableFile("CRD:STN1wind_",64,-2,MaxLines_wind,0,Min,0,LastWrittenFile_wind)
+  Average(1,WS1,FP2,False)
+  Maximum(1,WS1,FP2,False,False)
+  StdDev(1,WS1,FP2,False)
+  Average(1,WS2,FP2,False)
+  Maximum(1,WS2,FP2,False,False)
+  StdDev(1,WS2,FP2,False)
+  Average(4,Ux,IEEE4,disable_flag_on(1)) 'Ux, Uy, Uz, Ts averages where flagged values are excluded
+  StdDev(4,Ux,IEEE4,disable_flag_on(1))  'Ux, Uy, Uz, Ts standard deviations where flagged values are excluded
+  Totalize(1,n,IEEE4,disable_flag_on(1)) 'Number of valid CSAT records, i.e. all 4 flags are false
+  Totalize(1,n,IEEE4,NOT(disable_flag_on(1) OR disable_flag_on(2))) 'Number of invalid CSAT records (either any of the 4 CSAT flags is true or Ts = NaN)
+  FieldNames("csat_warnings")
+  'Totalize(1,n,IEEE4,NOT(delT_f) OR NOT disable_flag_on(2))
+  'FieldNames("delT_f_Tot")
+  'Totalize(1,n,IEEE4,NOT(sigl_f) OR NOT disable_flag_on(2))
+  'FieldNames("sigl_f_Tot")
+  'Totalize(1,n,IEEE4,NOT(amph_f) OR NOT disable_flag_on(2))
+  'FieldNames("amph_f_Tot")
+  'Totalize(1,n,IEEE4,NOT(ampl_f) OR NOT disable_flag_on(2))
+  'FieldNames("ampl_f_Tot")
+  Average(1,LI_CO2m,IEEE4,0)
+  Average(2,LI_H2Om,FP2,0) 'H2O and pressure where pressure is offset by -80kPa
+  StdDev(1,LI_CO2m,IEEE4,0)
+  StdDev(2,LI_H2Om,FP2,0) 'H2O and pressure
+EndTable
+
+DataTable(STN1OneMin,True,MaxLines_OneMin)    '32 columns in this table, incl. time stamp and record no., allocates the 
+                                              'memory needed for MaxLines_OneMin records
+  DataInterval(0,OFREQ2,Sec,0) 'Perhaps the DataInterval command is needed here for correct output of statistics such as average 
+                               ' and minimum. Also, memory usage is more efficient with this command
+  TableFile("CRD:STN1OneMin_",64,-2,MaxLines_OneMin,0,Min,0,LastWrittenFile_OneMin)
+  Sample(1,rmcutcdate,String)
+  Sample(1,rmcutctime,String)    'Sample(1,rmcutctime,FP2)
+  Sample(1,rmclatitude,String)   'Sample(1,rmclatitude,FP2)
+  Sample(1,rmclongitude,String)  'Sample(1,rmclongitude,FP2)
+  '  Totalize(1,clockdrift,Long,False)
+  Minimum(1,BattV,FP2,False,False)
+  Average(1,PTemp,FP2,False)
+  Sample(1,PowerSPC,FP2)
+  Sample(1,PowerLIC,FP2)
+  Sample(1,PowerHtr,FP2)
+  Sample(1,WD1,FP2)
+  Sample(1,WD2,FP2)
+  Sample(1,TA,FP2)
+  Sample(1,RH,FP2)
+  Sample(1,HS_Cor,FP2)
+  Sample(1,HS_Qty,FP2)
+  'Sample(1,SBTempK,FP2)
+  'Sample(1,SFTempK,FP2)
+  Sample(4,NetRad1,IEEE4) 'all 4 radiation components of upper net radiometer
+  Sample(4,NetRad2,IEEE4) 'all 4 radiation components of lower net radiometer
+  Sample(1,SWdn,FP2)
+  Sample(1,SensorT,FP2)
+  Sample(1,PF_FC4,IEEE4) 'store (average) particle flux of FlowCapt
+  Sample(1,WS_FC4,IEEE4) 'store (average) wind speed of FlowCapt
+EndTable
+
+' MEASUREMENTS=============================================
+
+' Main Program
+
+BeginProg
+  ' Set the n variable: This value is added for each record when counting the number of records using Totalize()
+  n = 1
+  
+  ' Open serial port for GPS
+  SerialOpen(GPSPort,38400,3,0,1001)
+
+  ' Set all CSAT3 variables to NaN.
+  Move(Ux,5,NaN,1)
+
+  ' Set the SDM clock speed.
+  SDMSpeed(SDM_PER)
+
+  'PortSet(C4,1)   'Provide 5V to port C4 to supply the camera.
+  ' The camera requires 6VDC but maybe 5V works as well...  NO, it doesn't
+
+  ' Initialize power management variables
+  SPC_State = 1 : PowerSPC = 1 'On
+  Timer(0,min,2)  'Reset and start timer0 for SPC power management
+  Timer(1,min,2)  'Reset and start timer1 for SPC power management
+
+  PowerLIC = 1    'Start program with LIC on
+  If PowerLIC = 0 Then 'Reset and Start Timer2 only if program starts with LIC off
+    Timer(2,min,2)
+  EndIf
+
+  'Initialize heater state of SN500SS net radiometers and CS320
+  PowerHtr = 1
+  If PowerHtr Then ' Turn on the heaters
+    SDI12Recorder(Heater_NetRad1,U9,4,"XHON!",1,0)
+    SDI12Recorder(Heater_NetRad2,U9,5,"XHON!",1,0)
+    SDI12Recorder(Heater,U9,2,"XHON!",1,0)        'turn on heater of CS320 (25mA @ 12V)
+  EndIf
+
+
+  RealTime(LoggerTime)  'Get first DOY for selecting output table 'Not needed anymore as we use TableFile instead of CardOut
+
+  'Main Scan+++++++++++++++++++++++++++++++++++++++++++++++
+
+  Scan(SFREQ1,mSec,10,0) 'BufferOption can be left at 0 if using SequentialMode (processing tasks need to finish in current 
+                          'scan). In PipeLineMode, BufferOption of 0, 1, or 2 means that 2 buffers are used.
+    
+    SDMTrigger()
+
+    ' *** Measure CSAT3-------------------------------------
+    CSAT3(Ux,1,CSAT3_address,98,CSAT_OPT)
+
+    ' *** Measure LI7500------------------------------------
+    CS7500(LI_CO2m,1,LIC75_address,6)
+    LI_Pres = LI_Pres - 80  'Offset to have smaller values and better precision while using data format FP2
+
+    ' CSAT3 processing--------------------------------------
+
+    ' Define 61502 as NaN
+    If (diag_csat = NaN) Then (diag_csat = 61502)
+
+    ' Break up the 4 CSAT3 warning flags in 4 separate bits
+    diag_csat_work = diag_csat
+    'delT_f = diag_csat_work AND &h8000
+    'sigl_f = diag_csat_work AND &h4000
+    'amph_f = diag_csat_work AND &h2000
+    'ampl_f = diag_csat_work AND &h1000
+
+    disable_flag_on(1) = diag_csat_work AND &hf000
+    disable_flag_on(2) = (disable_flag_on(1) AND NOT (Ts=NaN))
+
+    'If (diag_csat_work<&hf000) Then (diag_csat = INT(diag_csat_work/&h1000))
+
+    ' Call data tables and store Fast Data------------------
+
+    CallTable STN1fast
+
+    ' Measure wind speed as a running mean of the last minute
+    ' --- Dest, Reps, PChan, PConfig, POption (0=Counts, 1=Frequency Hz), Mult, Offset
+    ' *** Measure RMYoung wind------------------------------
+    PulseCount(WS1,1,U12,5,1000,0.1666,0)	'Young 1
+    PulseCount(WS2,1,U8, 5,1000,0.1666,0)	'Young 2
+
+    CallTable STN1wind
+
+  NextScan
+
+  ' +++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+  SlowSequence
+
+  Scan (SFREQ2,Sec,0,0) 'BufferOption can be left at 0 if using SequentialMode (processing tasks need to finish in current scan)
+			'In PipeLineMode, BufferOption of 0, 1, or 2 means that 2 buffers are used.
+    
+    ' Default CR6 Datalogger Battery Voltage measurement
+    ' *** Measurement
+    Battery(BattV)
+
+    ' Default CR6 Datalogger Wiring Panel Temperature measurement
+    ' *** Measurement
+    PanelTemp(PTemp,60)
+  
+    ' Get logger time
+    RealTime(LoggerTime)
+'     If hour = 0 AND minute = 0 Then
+'       ' Set logger time to GPS time
+'       ClockSet(rmcutctime)
+'       ' Check how much the logger clock has drifted since last clock set
+'       clockdrift = ClockChange
+'     EndIf
+
+    ' SPC-95 power management to save energy or create a new output file-------------
+    ' State machine adapted from Jerome's program
+    Select Case SPC_State
+
+    Case 1 'SPC: ON
+      If BattV < LowVoltSPC Then
+        SPC_State = 2 : PowerSPC = 0 'Go to OFF due to low voltage
+        Timer(0,min,2) ' Reset and start timer
+        'ElseIf Timer(0,min,4) >= SPCtimeBefore_WindCheck Then
+        '  SPC_State = 3 ' Go to Waiting state
+        '  Timer(0,min,2) ' Reset and start timer (for wind velocity check)
+      ElseIf Timer(1,min,4) >= SPCrestart Then
+        SPC_State = 5 : PowerSPC = 0' Go to Off in order to create new file
+        Timer(1,min,2) ' Reset and start timer1 (for new file)
+      EndIf
+
+    Case 2 'SPC: OFF due to low voltage
+      If BattV > (LowVoltSPC + DeltaVolt) Then
+        If Timer(0,min,4) >= OffTimeSPC_lowVolt Then
+          SPC_State = 1 : PowerSPC = 1' Go to On
+          Timer(1,min,2) ' Reset and start timer1 (for forced file restart)
+          Timer(0,min,2) ' Reset and start timer
+        EndIf
+      Else ' voltage is not above threshold
+        Timer(0,min,2) ' Reset and start timer for counting the time with voltage above threshold
+      EndIf
+
+      'Case 3 'Waiting while checking voltage, time since last file creation, and wind velocity
+      '  If BattV < LowVoltSPC Then
+      '    SPC_State = 2 : PowerSPC = 0 ' Go to Off due to low voltage
+      '    Timer(0,min,2) ' Reset and start timer
+      '  ElseIf Timer(1,min,4) >= SPCrestart Then
+      '    SPC_State = 5 : PowerSPC = 0 ' Go to Off in order to create new file
+      '    Timer(1,min,2) ' Reset and start timer1 (for new file)
+      '  ElseIf PowerSPC Then ' SPC is on, check whether wind velocity is low
+      '    If (WS1 < SPC_WindThresh) AND (WS2 < SPC_WindThresh) Then ' Use instantaneous wind velocity here for simplicity
+      '      If Timer(0,min,4) >= SPCtime_WindCheck Then
+      '        SPC_State = 4 : PowerSPC = 0' Go to Off due to low wind velocity
+      '        Timer(0,min,2) ' Reset and start timer
+      '      EndIf
+      '    Else ' wind velocity is not below threshold
+      '      Timer(0,min,2) ' Reset and start timer for counting the time with wind speed below threshold
+      '    EndIf
+      '  Else ' SPC is off, check whether wind velocity is above theshold
+      '    If (WS1 > SPC_WindThresh) OR (WS2 > SPC_WindThresh) Then ' Use instantaneous wind velocity here for simplicity
+      '      If Timer(0,min,4) >= SPCtime_WindCheck Then
+      '        SPC_State = 1 : PowerSPC = 1' Go to On because wind is strong enough to expect anow transport
+      '        Timer(1,min,2) ' Reset and start timer1 (for forced file restart)
+      '        Timer(0,min,2) ' Reset and start timer
+      '       EndIf
+      '    Else ' wind velocity is not above threshold
+      '      Timer(0,min,2) ' Reset and start timer for counting the time with wind speed above threshold
+      '    EndIf
+      '  EndIf
+
+      'Case 4 'Off due to low wind velocity
+      '  If Timer(0,min,4) >= SPCtimeBefore_WindCheck Then
+      '    SPC_State = 3 ' Go to Waiting state
+      '    Timer(0,min,2) ' Reset and start timer (for wind velocity check)
+      '  EndIf
+
+    Case 5 'SPC: OFF to create a new output file
+      If Timer(1,min,4) >= OffTimeSPC_NewFile Then
+        SPC_State = 1 : PowerSPC = 1 ' Go to ON
+        Timer(1,min,2) ' Reset and start timer1 (for forced file restart)
+        Timer(0,min,2) ' Reset and start timer
+      EndIf
+
+    EndSelect
+
+    SW12(1,PowerSPC)
+
+    ' Manage power of LI7500 using a state machine---------
+
+    Select Case PowerLIC
+
+    Case 0 'Off
+      If BattV > (LowVoltLIC + DeltaVolt) Then
+        If Timer(2,min,4) >= OffTimeLIC Then
+          PowerLIC = 1 ' Go to On
+          Timer(2,min,3) ' Stop and Reset timer2
+        EndIf
+      Else ' voltage is not above threshold
+        Timer(2,min,2) ' Reset and start timer2 for counting the time with voltage above threshold
+      EndIf
+
+    Case 1 'On
+      If BattV < LowVoltLIC Then
+        PowerLIC = 0 ' Go to Off due to low voltage
+        Timer(2,min,2) ' Reset and start timer (for LI7500)
+      EndIf
+
+    EndSelect
+
+    SW12(2,PowerLIC)
+    
+    ' Turn off/on heaters of net radiometers according to battery voltage ---------
+    
+    Select Case PowerHtr
+    
+    Case 0 'Heater OFF
+      If BattV > (LowVoltHtr + DeltaVolt) Then
+        If Timer(3,min,4) >= OffTimeHtr Then
+          PowerHtr = 1 ' Go to On
+          SDI12Recorder(Heater_NetRad1,U9,4,"XHON!",1,0) ' turn on heater of upper net radiometer
+          SDI12Recorder(Heater_NetRad2,U9,5,"XHON!",1,0) ' turn on heater of lower net radiometer
+          SDI12Recorder(Heater,U9,2,"XHON!",1,0)         ' turn on heater of CS320
+          Timer(3,min,3) ' Stop and Reset timer
+        EndIf
+      Else ' voltage is not above threshold
+        Timer(3,min,2) ' Reset and start timer for counting the time with voltage above threshold
+      EndIf
+
+    Case 1 'Heater ON
+      If BattV < LowVoltHtr Then
+        PowerHtr = 0 ' Go to Off due to low voltage
+        SDI12Recorder(Heater_NetRad1,U9,4,"XHOFF!",1,0) ' turn off heater of upper net radiometer
+        SDI12Recorder(Heater_NetRad2,U9,5,"XHOFF!",1,0) ' turn off heater of lower net radiometer
+        SDI12Recorder(Heater,U9,2,"XHOFF!",1,0)         ' turn off heater of CS320
+        Timer(3,min,2) ' Reset and start timer (for heater)
+      EndIf
+
+    EndSelect
+    
+    ' YOUNG1 (WD only)
+    ' --- Dest, Reps, Range, SEChan, ExChan, MeasPEx, ExmV, RevEx, Settlingtime, fN1, Mult, Offset
+    ' *** Measurement
+    BrHalf(WD1,1,mV5000,U3,U6,1,2500,True,20000,60,355,0) '20000 seems long, normally 0-500usec...
+    If WD1>=360 Then WD1=0
+    If WD1<0 Then WD1=0
+
+    ' YOUNG2 (WD only)
+    ' --- Dest, Reps, Range, SEChan, ExChan, MeasPEx, ExmV, RevEx, Settlingtime, fN1, Mult, Offset
+    ' *** Measurement
+    BrHalf(WD2,1,mV5000,U4,U6,1,2500,True,20000,60,355,0) '20000 seems long, normally 0-500usec...
+    If WD2>=360 Then WD2=0
+    If WD2<0 Then WD2=0
+
+    ' SI-111
+    ' --- Dest, Reps, SEChan, ExChan, SettlingTime, fN1, Mult, Offset
+    ' *** Measurement of sensor body temperature with inbuilt thermistor
+    'Therm109(SBTempC,1,U6,U11,0,_60Hz,1,0)
+    ' --- Dest, Reps, Range, DiffChan, RevDiff, SettlingTime, fN1, Mult, Offset
+    ' *** Measurement thermopile detector (red = Sig+ = U7, sw = Sig- = U8)
+    'VoltDiff(TargmV,1,mV5000,U7,True,0,_60Hz,1,0)
+    ' Calculation of m (slope) and b (intercept) coeffs for target temp calculation
+    'm = mC2 * SBTempC^2 + mC1 * SBTempC + mC0
+    'b = bC2 * SBTempC^2 + bC1 * SBTempC + bC0
+    ' Calculation of target temperature
+    'SBTempK = SBTempC + 273.15
+    'SFTempK = ((SBTempK^4) + m * TargmV + b)^0.25
+      
+    ' HygroVUE10 (SDI-12 address: 0)
+    ' --- Dest, SDIPort, SDIAddress, SDICommand, Mult, Offset
+    ' *** Measurement
+    SDI12Recorder(TRHData(),U9,0,"M!",1,0)
+    
+    ' SR50A (SDI-12 address: 1)
+    ' --- Dest, SDIPort, SDIAddress, SDICommand, Mult, Offset
+    ' Use SDI12 command "M1!" to receive Distance and Signal quality from the SR50A
+    ' *** Measurement
+    SDI12Recorder(HSData(),U9,1,"M1!",1,0)
+    ' Use TA to calculate corrected distance:
+    HS_Cor=HS_Raw*(SQR((TA+273.15)/273.15))
+
+    ' GPS
+    ' *** Measurement
+    SerialInRecord (GPSPort,rawdata,36,0,&h0D0A,NBytesReturned,11)
+    CalculatedChecksum = CheckSum (rawdata,9,Len(rawdata) - 3)
+    CalculatedChecksum = CalculatedChecksum AND 255
+    ReportedChecksum = HexToDec(Right(rawdata,2))
+    If CalculatedChecksum = ReportedChecksum Then
+      If InStr (1,rawdata,"GPRMC",2) Then
+        RMCstring = rawdata
+      Else
+      ' If this string is not the correct one, try the next
+      ' *** Measurement
+        SerialInRecord (GPSPort,rawdata,36,0,&h0D0A,NBytesReturned,11)
+        CalculatedChecksum = CheckSum (rawdata,9,Len(rawdata) - 3)
+        CalculatedChecksum = CalculatedChecksum AND 255
+        ReportedChecksum = HexToDec(Right(rawdata,2))
+        If CalculatedChecksum = ReportedChecksum Then
+          If InStr (1,rawdata,"GPRMC",2) Then
+            RMCstring = rawdata
+          EndIf
+        EndIf
+      EndIf
+    EndIf
+    ' Parse rmc data
+    SplitStr (SubStrings(),RMCstring,",",16,5)
+    rmcstatus = SubStrings(3)
+    If (Mid(Trim(rmcutctime), 1, 5)=Mid(Trim(SubStrings(2)), 1, 5)) Then rmcstatus = "V" ' Fix to a bug in the Com: 
+                            ' When unplugged, returns the previous string but with 1 extra second!!! "V" means invalid.
+    If rmcstatus = "A" Then ' A means valid data
+      'Mainly interested in utc time, so most other variables are commented out
+      'rmcid = SubStrings(1)
+      rmcutctime = SubStrings(2)
+      'rmcstatus = SubStrings(3)
+      rmclatitude = SubStrings(4)
+      'rmcin_s_ind =SubStrings(5)
+      rmclongitude=SubStrings(6)
+      'rmce_w_indicator=SubStrings(7)
+      'rmcspeed=SubStrings(8)
+      'rmccourse=SubStrings(9)
+      rmcutcdate=SubStrings(10)
+      'rmcmagvariation=SubStrings(11)
+      'rmcmage_w =Left(SubStrings(12),1)
+      'rmcchecksum=Right(RMCstring,2)
+    Else
+      rmcutctime   = ""
+      rmclatitude  = ""
+      rmclongitude = ""
+      rmcutcdate   = ""
+    EndIf
+    
+    ' CS320 (SDI-12 address: 2)
+    ' --- Dest, SDIPort, SDIAddress, SDICommand, Mult, Offset
+    ' *** Measurement
+    SDI12Recorder(CS320(),U9,2,"M4!",1,0)
+  
+    ' FlowCapt FC4 (SDI-12 address: 3?)
+    SDI12Recorder(FC4(),U9,3,"M!",1,0)
+  
+    ' upper SN500SS net radiometer (SDI-12 address: 4)
+    SDI12Recorder(NetRad1(),U9,4,"MC!",1,0)
+    ' lower SN500SS net radiometer (SDI-12 address: 5)
+    SDI12Recorder(NetRad2(),U9,5,"MC!",1,0)
+    ' "MC!" starts a measurement with cyclic redundancy check, i.e. if a checksum is invalid, measurement is repeated up to 3 times.
+    
+    CallTable STN1OneMin
+
+  NextScan
+
+  EndSequence
+
+EndProg
