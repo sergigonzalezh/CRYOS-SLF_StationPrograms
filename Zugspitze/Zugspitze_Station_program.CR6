@@ -1,8 +1,8 @@
 ' ---------------------------------------------------------
 ' CR6 Series
 ' Program: Zugspitze
-' Author: Sergi Gonzalez from Thierry Hartmann program
-' Date: 04.10.2023, Version 1.0
+' Author: Sergi Gonzalez from Thierry Hartmann program - Updates for modem suggested by David Lehmann
+' Date: 20.04.2026, Version 2.0
 ' Recycling from Davis_2019_v12 with LI-7500A & CSAT3
 '
 ' Program measures:
@@ -155,6 +155,9 @@ Public LoggerTime(9) As Long
 Alias LoggerTime(2) = month
 Alias LoggerTime(9) = doy
 
+' Modem----------------------------------------------------
+Public MODEM_PWR_ON As Boolean = True
+
 ' GPS using the Serial Instruction------------------------- 
 
 'GPS16X-HVS at Campbell Scientific Factory Defaults
@@ -248,7 +251,7 @@ Units WD2 = deg			    'YOUNG2
 
 ' Define Data Tables---------------------------------------
 
-DataTable(DAVISwind,True,-1)
+DataTable(ZUGSPITZEwind,True,-1)
 	DataInterval(0,OFREQ2,Sec,0)
 	CardOut(1,nRec2)
   Average(1,WS1,FP2,False)        ' mean over OFREQ2 interval (here 1min)
@@ -261,7 +264,7 @@ DataTable(DAVISwind,True,-1)
   StdDev(1,Ux,IEEE4,False)
 EndTable
 
-DataTable(DAVIS1Min,True,-1)    'XX columns in table, incl. time stamp and record no.
+DataTable(ZUGSPITZE1Min,True,-1)    'XX columns in table, incl. time stamp and record no.
   DataInterval(0,OFREQ2,Sec,0)
   CardOut(1,nRec2)
 '  Sample (1,latitude_a,FP2)
@@ -333,7 +336,7 @@ DataTable(DAVIS1Min,True,-1)    'XX columns in table, incl. time stamp and recor
   FieldNames("li_sync")
 EndTable
 
-DataTable(DAVIS1Min_HS,True,-1)    'XX columns in table, incl. time stamp and record no.
+DataTable(ZUGSPITZE1Min_HS,True,-1)    'XX columns in table, incl. time stamp and record no.
   DataInterval(0,OFREQ2,Sec,0)
   CardOut(1,nRec2)
   Sample(1,HS_Cor,FP2)
@@ -341,28 +344,28 @@ DataTable(DAVIS1Min_HS,True,-1)    'XX columns in table, incl. time stamp and re
 EndTable
 
 
-DataTable(DAVISfast01,True,-1)
+DataTable(ZUGSPITZEfast01,True,-1)
   DataInterval(0,OFREQ1,mSec,10)
   CardOut(1,-1)
   Sample(4,Ux,IEEE4)
   Sample(4,LI_CO2m,IEEE4)
 EndTable
 
-DataTable(DAVISfast02,True,-1)
+DataTable(ZUGSPITZEfast02,True,-1)
   DataInterval(0,OFREQ1,mSec,10)
   CardOut(1,-1)
   Sample(4,Ux,IEEE4)
   Sample(4,LI_CO2m,IEEE4)
 EndTable
 
-DataTable(DAVISfast03,True,-1)
+DataTable(ZUGSPITZEfast03,True,-1)
   DataInterval(0,OFREQ1,mSec,10)
   CardOut(1,-1)
   Sample(4,Ux,IEEE4)
   Sample(4,LI_CO2m,IEEE4)
 EndTable
 
-DataTable(DAVISfast04,True,-1)
+DataTable(ZUGSPITZEfast04,True,-1)
   DataInterval(0,OFREQ1,mSec,10)
   CardOut(1,-1)
   Sample(4,Ux,IEEE4)
@@ -445,31 +448,31 @@ BeginProg
       
       Select Case WhichTable
       Case 1
-        CallTable DAVISfast01
+        CallTable ZUGSPITZEfast01
       Case 2
-        CallTable DAVISfast02
+        CallTable ZUGSPITZEfast02
       Case 3
-        CallTable DAVISfast03
+        CallTable ZUGSPITZEfast03
       Case 4
-        CallTable DAVISfast04
+        CallTable ZUGSPITZEfast04
       Case 5
-        CallTable DAVISfast01
+        CallTable ZUGSPITZEfast01
       Case 6
-        CallTable DAVISfast02
+        CallTable ZUGSPITZEfast02
       Case 7
-        CallTable DAVISfast03
+        CallTable ZUGSPITZEfast03
       Case 8
-        CallTable DAVISfast04
+        CallTable ZUGSPITZEfast04
       Case 9
-        CallTable DAVISfast01
+        CallTable ZUGSPITZEfast01
       Case 10
-        CallTable DAVISfast02
+        CallTable ZUGSPITZEfast02
       Case 11
-        CallTable DAVISfast03
+        CallTable ZUGSPITZEfast03
       Case 12
-        CallTable DAVISfast04
+        CallTable ZUGSPITZEfast04
       Case Else
-        CallTable DAVISfast01
+        CallTable ZUGSPITZEfast01
       EndSelect
 
     '*** Measure wind speed as a mean of the last second (1000ms)
@@ -478,11 +481,14 @@ BeginProg
     PulseCount(WS2,1,U2 ,5,1000,0.1666,0)	' Young 2
     'PulseCount instruction not allowed in SlowSequence
     
-    CallTable DAVISwind
+    CallTable ZUGSPITZEwind
   NextScan
 
   '++++++++++++++++++++++++++++++++++++++++++++++++++++++++
   SlowSequence
+  
+  SW12(SW12_2,0) 'switch modem on at beginning, solidstate relay normally closed
+  MODEM_PWR_ON = True
 
   Scan (SFREQ2,Sec,3,0)
 
@@ -491,6 +497,17 @@ BeginProg
     
     '*** Measure the Datalogger Battery Voltage
     Battery(BattV)
+    
+    '*** Modem reset every week
+    If (LoggerTime(8) = 2 AND TimeIsBetween(650,656,1440,min)) Then
+      If MODEM_PWR_ON = True
+        MODEM_PWR_ON = False
+        SW12(SW12_2,1) 'switch modem off solidstate relay normally closed
+      EndIf
+    ElseIf MODEM_PWR_ON = False
+      MODEM_PWR_ON = True
+      SW12(SW12_2,0) 'switch modem on, solidstate relay normally closed
+    EndIf  
 
     '*** Measure the Datalogger Wiring Panel Temperature
     PanelTemp(PTemp,60)
@@ -631,7 +648,7 @@ BeginProg
 '     ggageoidunits=Left(SubStrings(13),1)
 '     ggachecksum=Right(GGAstring,2)
 
-  CallTable DAVIS1Min
+  CallTable ZUGSPITZE1Min
 
   NextScan
 
@@ -663,10 +680,9 @@ BeginProg
             
           EndIf
         EndIf
-      CallTable DAVIS1min_HS
+      CallTable ZUGSPITZE1min_HS
       NextScan
   
   EndSequence
   
 EndProg
-   þ        
