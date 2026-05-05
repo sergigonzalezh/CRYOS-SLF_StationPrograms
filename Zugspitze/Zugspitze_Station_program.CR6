@@ -2,8 +2,16 @@
 ' CR6 Series
 ' Program: Zugspitze
 ' Author: Sergi Gonzalez from Thierry Hartmann program - Updates for modem suggested by David Lehmann
-' Date: 20.04.2026, Version 2.0
-' Recycling from Davis_2019_v12 with LI-7500A & CSAT3
+' Date: 01.05.2026, Version 3.0
+' Based on v2.0 (20.04.2026)
+' Changes in v3.0:
+'   - Merged ZUGSPITZEwind table into ZUGSPITZE1Min (all 1-min meteo in one table)
+'   - Merged ZUGSPITZE1Min_HS (median snow height) into ZUGSPITZE1Min
+'   - Replaced 4x ZUGSPITZEfast tables + DOY Select Case with single
+'     ZUGSPITZEfast table using TableFile for daily TOB3 files on card
+'     (same approach as Tschuggen IrgaWindFast)
+'   - Added FieldNames for clarity (Tschuggen convention)
+'   - Added version string (Tschuggen convention)
 '
 ' Program measures:
 '  1x Licor LI-7500A C02/H20 Gas Analyzer
@@ -44,12 +52,13 @@ SequentialMode
 
 ' DECLARATIONS=============================================
 
+Public StrRev As String * 6 = "v3.0.0"
+
 ' Declare local time offset relative to UTC time for GPS
 Const LOCAL_TIME_OFFSET = 0    ' Local time offset relative to UTC time
 
 ' Power cut-off values (battery voltage)
 Const LowVoltSPC = 12.2        ' Low power threshold for SPC-95,  (PowerSPC, SW1)
-'Const LowVoltIRG = 12.0        ' Low power threshold for IRGASON, (PowerIRG, SW2)
 
 ' SPC-95 parameters
 ' Values for field installation
@@ -67,13 +76,9 @@ Const OFREQ1 = 100    ' [mSec] fast output (CSAT3, LI7500, 10Hz)
 Const OFREQ2 = 60     ' [Sec]  slow output (Meteo/Stat data, 1min)
 
 ' Table Management-----------------------------------------
-' Output Data Table selection for fast freq. data is based on Day of Year (DOY)
-' Data is written for 28 days to a table before a new Table is started
-' Note: A 10Hz scan frequency produces 864'000 records (lines) per day
-' Table space is auto-allocated between 13 tables for the fast data.
-' 1min data tables have specified record lengths, i.e. 365*24*60 = 1 year 
-
-Dim WhichTable As Long
+' v3.0: Fast data uses a single table with TableFile for automatic daily
+'       TOB3 files on the card (same approach as Tschuggen IrgaWindFast).
+'       All 1-min data (wind, meteo, snow height) merged into one table.
 Const nRec2 = 247*24*60  '#recs to allocate for slow output for 1 year @1min
 
 
@@ -145,12 +150,11 @@ Dim diag_licor_work As Long
 
 ' Power and Time
 Public BattV
-Public PowerSPC   ', PowerIRG
+Public PowerSPC
 Public timer_PowerSPC_off, timer_PowerSPC_on
 Public timer_PowerSPC_off_offset
 Units BattV = V
 
-'Public clockmod
 Public LoggerTime(9) As Long
 Alias LoggerTime(2) = month
 Alias LoggerTime(9) = doy
@@ -164,35 +168,10 @@ Public MODEM_PWR_ON As Boolean = True
 Const GPSPort = ComRS232 'Com port where GPS is connected
 Public GGAstring As String * 500
 Public RMCstring As String * 500
-'rmc variables
-'Public rmcid As String
 Public rmcutc As String
-'Public rmcstatus As String
 Public rmclatitude As String
-'Public rmcin_s_ind As String
 Public rmclongitude As String
-'Public rmcie_w_ind As String
-'Public rmcspeed As String
-'Public rmccourse As String
 Public rmcutcdate As String
-'Public rmcmagvariation As String
-'Public rmcmage_w As String
-'Public rmcchecksum As String
-'gga variables
-'Public ggaid As String
-'Public ggautc As String
-'Public ggailatitude As String
-'Public ggan_s_ind As String
-'Public ggalongitude As String
-'Public ggae_w_ind As String
-'Public ggapositionfix As String
-'Public gganumsatellites As String
-'Public ggahdop As String
-'Public ggaaltitude As String
-'Public ggaaltutudeunits As String
-'Public ggageoidsep As String
-'Public ggageoidunits As String
-'Public ggachecksum As String
 
 Dim NBytesReturned As Long
 Dim SubStrings(16) As String * 32, rawdata As String * 500
@@ -225,7 +204,6 @@ Alias HSData_Raw(2)=HS_Qty_Raw : Units HS_Qty_Raw = unitless	'SR50A
 Public Results_HSData(11,2)                           'SR50A'
 Public HS_Cor       : Units HS_Cor       = meters 	  'SR50A'
 Public HS_Qty       : Units HS_Qty       = unitless   'SR50A'
-'Public SR50ACtrl As Boolean
 Public TRHData_Fast(2)         'T for SR50A correction'
 Alias TRHData_Fast(1) = TAfast 'T for SR50A correction'
 Public SR50ACtrl As Boolean
@@ -249,72 +227,120 @@ Units WD1 = deg			    'YOUNG1
 Units WS2 = m/s			    'YOUNG2
 Units WD2 = deg			    'YOUNG2
 
-' Define Data Tables---------------------------------------
+' =========================================================
+' Define Data Tables
+' =========================================================
 
-DataTable(ZUGSPITZEwind,True,-1)
-	DataInterval(0,OFREQ2,Sec,0)
-	CardOut(1,nRec2)
-  Average(1,WS1,FP2,False)        ' mean over OFREQ2 interval (here 1min)
-  Maximum(1,WS1,FP2,False,False)  ' max. over a 1sec interval (wind gust)
-  StdDev(1,WS1,FP2,False)         ' Std. over OFREQ2 interval (here 1min)
-  Average(1,WS2,FP2,False)
-  Maximum(1,WS2,FP2,False,False)
-  StdDev(1,WS2,FP2,False)
-  Average(4,Ux,IEEE4,False)
-  StdDev(1,Ux,IEEE4,False)
+' --- FAST DATA TABLE (10Hz CSAT3 + LI-7500A) ---
+' v3.0: Single table with TableFile for automatic daily TOB3 files on card.
+'       Replaces the 4x ZUGSPITZEfast01-04 tables + DOY Select Case logic.
+'       TOB3 format (option 64) supports >2GB and is more efficient.
+DataTable(ZUGSPITZEfast,True,-1)
+  DataInterval(0,OFREQ1,mSec,10)
+  'Create a new file every 24h on the card, TOB3 format, no file limit, auto-delete oldest
+  TableFile("CRD:ZUGSPITZEfast",64,-1,0,24,hr,0,0)
+  Sample(1,Ux,IEEE4)
+  FieldNames("Ux: CSAT3 Ux [m/s]")
+  Sample(1,Uy,IEEE4)
+  FieldNames("Uy: CSAT3 Uy [m/s]")
+  Sample(1,Uz,IEEE4)
+  FieldNames("Uz: CSAT3 Uz [m/s]")
+  Sample(1,Ts,IEEE4)
+  FieldNames("Ts: Sonic Temp [degC]")
+  Sample(1,LI_CO2m,IEEE4)
+  FieldNames("LI_CO2m: CO2 density [mmol/m3]")
+  Sample(1,LI_H2Om,IEEE4)
+  FieldNames("LI_H2Om: H2O density [mmol/m3]")
+  Sample(1,LI_Pres,IEEE4)
+  FieldNames("LI_Pres: Air Pressure [kPa]")
+  Sample(1,LI_diag,IEEE4)
+  FieldNames("LI_diag: LI-7500A Diagnostic Flag")
 EndTable
 
-DataTable(ZUGSPITZE1Min,True,-1)    'XX columns in table, incl. time stamp and record no.
+' --- 1-MINUTE METEO TABLE (all slow data consolidated) ---
+' v3.0: Merged wind stats (from old ZUGSPITZEwind) and median snow height
+'       (from old ZUGSPITZE1Min_HS) into this single table.
+DataTable(ZUGSPITZE1Min,True,-1)
   DataInterval(0,OFREQ2,Sec,0)
   CardOut(1,nRec2)
-'  Sample (1,latitude_a,FP2)
-'  Sample (1,longitude_a,FP2)
-'  Sample (1,altitude,FP2)
-'  Totalize (1,clockmod,Long,False)
-'  Sample (1,rmcid,String)
-  Sample (1,rmcutc,String)
-'  Sample (1,rmcstatus,String)
-  Sample (1,rmclatitude,String)
-'  Sample (1,rmcin_s_ind,String)
-  Sample (1,rmclongitude,String)
-'  Sample (1,rmcie_w_ind,String)
-'  Sample (1,rmcspeed,String)
-'  Sample (1,rmccourse,String)
-  Sample (1,rmcutcdate,String)
-'  Sample (1,rmcmagvariation,String)
-'  Sample (1,rmcmage_w,String)
-'  Sample (1,rmcchecksum,String)
-'  Sample (1,ggaid,String)
-'  Sample (1,ggautc,String)
-'  Sample (1,ggan_s_ind,String)
-'  Sample (1,ggalongitude,String)
-'  Sample (1,ggae_w_ind,String)
-'  Sample (1,ggapositionfix,String)
-'  Sample (1,gganumsatellites,String)
-'  Sample (1,ggahdop,String)
-'  Sample (1,ggaaltitude,String)
-'  Sample (1,ggaaltutudeunits,String)
-'  Sample (1,ggageoidsep,String)
-'  Sample (1,ggageoidunits,String)
-'  Sample (1,ggachecksum,String)
 
+  ' --- GPS ---
+  Sample(1,rmcutc,String)
+  Sample(1,rmclatitude,String)
+  Sample(1,rmclongitude,String)
+  Sample(1,rmcutcdate,String)
+
+  ' --- Logger diagnostics ---
   Minimum(1,BattV,FP2,False,False)
+  FieldNames("BattV_Min: minimum battery voltage [V]")
   Average(1,PTemp,FP2,False)
-  Sample (1,PowerSPC,Long,False)
-'  Sample (1,PowerIRG,Long,False)
+  FieldNames("PTemp_Avg: panel temperature [C]")
+  Sample(1,PowerSPC,Long,False)
+  FieldNames("PowerSPC: SPC power state")
+
+  ' --- Young wind monitors (1-min statistics) ---
+  ' (Previously in separate ZUGSPITZEwind table)
+  Average(1,WS1,FP2,False)
+  FieldNames("WS1_Avg: Young1 mean wind speed [m/s]")
+  Maximum(1,WS1,FP2,False,False)
+  FieldNames("WS1_Max: Young1 gust [m/s]")
+  StdDev(1,WS1,FP2,False)
+  FieldNames("WS1_Std: Young1 wind speed std [m/s]")
   Sample(1,WD1,FP2)
+  FieldNames("WD1: Young1 wind direction [deg]")
+  Average(1,WS2,FP2,False)
+  FieldNames("WS2_Avg: Young2 mean wind speed [m/s]")
+  Maximum(1,WS2,FP2,False,False)
+  FieldNames("WS2_Max: Young2 gust [m/s]")
+  StdDev(1,WS2,FP2,False)
+  FieldNames("WS2_Std: Young2 wind speed std [m/s]")
   Sample(1,WD2,FP2)
+  FieldNames("WD2: Young2 wind direction [deg]")
+
+  ' --- CSAT3 sonic 1-min statistics ---
+  Average(4,Ux,IEEE4,False)
+  FieldNames("Ux_Avg: CSAT3 Ux avg [m/s],Uy_Avg: CSAT3 Uy avg [m/s],Uz_Avg: CSAT3 Uz avg [m/s],Ts_Avg: Sonic temp avg [degC]")
+  StdDev(4,Ux,IEEE4,False)
+  FieldNames("Ux_Std: CSAT3 Ux std [m/s],Uy_Std: CSAT3 Uy std [m/s],Uz_Std: CSAT3 Uz std [m/s],Ts_Std: Sonic temp std [degC]")
+
+  ' --- Temperature / Humidity ---
   Sample(1,TA,FP2)
+  FieldNames("TA: CS215 air temperature [C]")
   Sample(1,RH,FP2)
+  FieldNames("RH: CS215 relative humidity [%]")
+
+  ' --- Snow height (1-min from SlowSequence 1) ---
   Sample(1,HS_Cor_1min,FP2)
+  FieldNames("HS_Cor_1min: SR50A corrected distance 1min [m]")
   Sample(1,HS_Qty_1min,FP2)
+  FieldNames("HS_Qty_1min: SR50A signal quality 1min")
+
+  ' --- Snow height (median-filtered from SlowSequence 2) ---
+  ' (Previously in separate ZUGSPITZE1Min_HS table)
+  Sample(1,HS_Cor,FP2)
+  FieldNames("HS_Cor: SR50A median corrected distance [m]")
+  Sample(1,HS_Qty,FP2)
+  FieldNames("HS_Qty: SR50A median signal quality")
+
+  ' --- Surface temperature (SI-111) ---
   Sample(1,SBTempC,IEEE4)
+  FieldNames("SBTempC: SI-111 sensor body temp [C]")
   Sample(1,SFTempC,IEEE4)
+  FieldNames("SFTempC: SI-111 surface temp [C]")
+
+  ' --- LI-7500A 1-min statistics ---
   Average(4,LI_CO2m,IEEE4,0)
-  StdDev (4,LI_CO2m,IEEE4,0)
+  FieldNames("LI_CO2m_Avg: CO2 avg [mmol/m3],LI_H2Om_Avg: H2O avg [mmol/m3],LI_Pres_Avg: Pres avg [kPa],LI_diag_Avg: diag avg")
+  StdDev(4,LI_CO2m,IEEE4,0)
+  FieldNames("LI_CO2m_Std: CO2 std [mmol/m3],LI_H2Om_Std: H2O std [mmol/m3],LI_Pres_Std: Pres std [kPa],LI_diag_Std: diag std")
+
+  ' --- CSAT3 diagnostic totals ---
   Average(4,Ux,IEEE4,disable_flag_on(1))
-  StdDev (4,Ux,IEEE4,disable_flag_on(1))
+  FieldNames("Ux_Avg_filt,Uy_Avg_filt,Uz_Avg_filt,Ts_Avg_filt")
+  StdDev(4,Ux,IEEE4,disable_flag_on(1))
+  FieldNames("Ux_Std_filt,Uy_Std_filt,Uz_Std_filt,Ts_Std_filt")
   Totalize(1,n,IEEE4,disable_flag_on(1))
+  FieldNames("csat_good_samples")
   Totalize(1,n,IEEE4,NOT(disable_flag_on(1) OR disable_flag_on(2)))
   FieldNames("csat_warnings")
   Totalize(1,n,IEEE4,NOT(delT_f) OR NOT disable_flag_on(2))
@@ -325,7 +351,8 @@ DataTable(ZUGSPITZE1Min,True,-1)    'XX columns in table, incl. time stamp and r
   FieldNames("amph_f_Tot")
   Totalize(1,n,IEEE4,NOT(ampl_f) OR NOT disable_flag_on(2))
   FieldNames("ampl_f_Tot")
-  
+
+  ' --- LI-7500A diagnostic totals ---
   Totalize(1,n,IEEE4,li_chopper)
   FieldNames("li_chopper")
   Totalize(1,n,IEEE4,li_detector)
@@ -336,41 +363,6 @@ DataTable(ZUGSPITZE1Min,True,-1)    'XX columns in table, incl. time stamp and r
   FieldNames("li_sync")
 EndTable
 
-DataTable(ZUGSPITZE1Min_HS,True,-1)    'XX columns in table, incl. time stamp and record no.
-  DataInterval(0,OFREQ2,Sec,0)
-  CardOut(1,nRec2)
-  Sample(1,HS_Cor,FP2)
-  Sample(1,HS_Qty,FP2)
-EndTable
-
-
-DataTable(ZUGSPITZEfast01,True,-1)
-  DataInterval(0,OFREQ1,mSec,10)
-  CardOut(1,-1)
-  Sample(4,Ux,IEEE4)
-  Sample(4,LI_CO2m,IEEE4)
-EndTable
-
-DataTable(ZUGSPITZEfast02,True,-1)
-  DataInterval(0,OFREQ1,mSec,10)
-  CardOut(1,-1)
-  Sample(4,Ux,IEEE4)
-  Sample(4,LI_CO2m,IEEE4)
-EndTable
-
-DataTable(ZUGSPITZEfast03,True,-1)
-  DataInterval(0,OFREQ1,mSec,10)
-  CardOut(1,-1)
-  Sample(4,Ux,IEEE4)
-  Sample(4,LI_CO2m,IEEE4)
-EndTable
-
-DataTable(ZUGSPITZEfast04,True,-1)
-  DataInterval(0,OFREQ1,mSec,10)
-  CardOut(1,-1)
-  Sample(4,Ux,IEEE4)
-  Sample(4,LI_CO2m,IEEE4)
-EndTable
 
 ' MEASUREMENTS=============================================
 
@@ -442,38 +434,9 @@ BeginProg
       li_detector = diag_licor_work AND &h40
       li_pll = diag_licor_work AND &h20
       li_sync = diag_licor_work AND &h10
-      'Call data tables and store Fast Data----------------
 
-      WhichTable = Floor(doy/28) + 1  
-      
-      Select Case WhichTable
-      Case 1
-        CallTable ZUGSPITZEfast01
-      Case 2
-        CallTable ZUGSPITZEfast02
-      Case 3
-        CallTable ZUGSPITZEfast03
-      Case 4
-        CallTable ZUGSPITZEfast04
-      Case 5
-        CallTable ZUGSPITZEfast01
-      Case 6
-        CallTable ZUGSPITZEfast02
-      Case 7
-        CallTable ZUGSPITZEfast03
-      Case 8
-        CallTable ZUGSPITZEfast04
-      Case 9
-        CallTable ZUGSPITZEfast01
-      Case 10
-        CallTable ZUGSPITZEfast02
-      Case 11
-        CallTable ZUGSPITZEfast03
-      Case 12
-        CallTable ZUGSPITZEfast04
-      Case Else
-        CallTable ZUGSPITZEfast01
-      EndSelect
+      ' v3.0: Single fast table call replaces the DOY-based Select Case
+      CallTable ZUGSPITZEfast
 
     '*** Measure wind speed as a mean of the last second (1000ms)
     '--- rd=P_LLAC, bk=WS_gnd, gn=WD_Sig, bl=WD_Ex, gy/wh=WD_gnd, cl=shld
@@ -481,7 +444,6 @@ BeginProg
     PulseCount(WS2,1,U2 ,5,1000,0.1666,0)	' Young 2
     'PulseCount instruction not allowed in SlowSequence
     
-    CallTable ZUGSPITZEwind
   NextScan
 
   '++++++++++++++++++++++++++++++++++++++++++++++++++++++++
@@ -618,36 +580,12 @@ BeginProg
 
      'parse rmc data
      SplitStr (SubStrings(),RMCstring,",",16,5)
-'     rmcid = SubStrings(1)
      rmcutc = SubStrings(2)
-'     rmcstatus = SubStrings(3)
      rmclatitude = SubStrings(4)
-'     rmcin_s_ind = SubStrings(5)
      rmclongitude = SubStrings(6)
-'     rmcie_w_ind = SubStrings(7)
-'     rmcspeed = SubStrings(8)
-'     rmccourse = SubStrings(9)
      rmcutcdate = SubStrings(10)
-'     rmcmagvariation = SubStrings(11)
-'     rmcmage_w = Left(SubStrings(12),1)
-'     rmcchecksum = Right(RMCstring,2)
-     'parse gga data
-'     SplitStr (SubStrings(),GGAstring,",",16,5)
-'     ggaid=SubStrings(1)
-'     ggautc=SubStrings(2)
-'     ggailatitude=SubStrings(3)
-'     ggan_s_ind=SubStrings(4)
-'     ggalongitude=SubStrings(5)
-'     ggae_w_ind=SubStrings(6)
-'     ggapositionfix=SubStrings(7)
-'     gganumsatellites=SubStrings(8)
-'     ggahdop=SubStrings(9)
-'     ggaaltitude=SubStrings(10)
-'     ggaaltutudeunits=SubStrings(11)
-'     ggageoidsep=SubStrings(12)
-'     ggageoidunits=Left(SubStrings(13),1)
-'     ggachecksum=Right(GGAstring,2)
 
+  ' v3.0: Single CallTable replaces the old ZUGSPITZE1Min + ZUGSPITZEwind
   CallTable ZUGSPITZE1Min
 
   NextScan
@@ -680,7 +618,8 @@ BeginProg
             
           EndIf
         EndIf
-      CallTable ZUGSPITZE1min_HS
+      ' v3.0: No separate CallTable here; HS_Cor and HS_Qty are picked up
+      '        by the main ZUGSPITZE1Min table via Sample()
       NextScan
   
   EndSequence
